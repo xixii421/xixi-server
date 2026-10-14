@@ -1,3 +1,4 @@
+> **Single-GPU learning adaptation (work in progress).** This repository preserves the upstream ModServe implementation and history. The original multi-GPU setup below is not yet runnable on one 8 GiB GPU. See [SINGLE_GPU_PLAN.md](SINGLE_GPU_PLAN.md) for the adaptation scope and milestones. Upstream: [Azure/ModServe](https://github.com/Azure/ModServe).
 # ModServe
 
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
