@@ -1,1 +1,0 @@
-request_id,iteration,vllm_requestbody_processing_time,waiting_time,num_prefills,prefill_ms

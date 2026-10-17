@@ -1,0 +1,19 @@
+{
+  "host": "127.0.0.1",
+  "port": 7070,
+  "image_port": 7081,
+  "text_port": 7082,
+  "gloo_port": 29510,
+  "image_dir": "images",
+  "metrics_dir": "metrics/single_gpu_mock",
+  "request_timeout_s": 15,
+  "transfer_timeout_s": 5,
+  "startup_timeout_s": 30,
+  "max_inflight": 4,
+  "max_images": 8,
+  "max_image_bytes": 10485760,
+  "max_image_pixels": 16777216,
+  "max_pending_bytes": 1048576,
+  "feature_ttl_s": 30,
+  "mock_encode_ms": 5
+}

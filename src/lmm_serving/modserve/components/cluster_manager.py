@@ -9,7 +9,6 @@ import time
 import os
 import json
 import sys
-import uuid
 import yaml
 import pandas as pd
 import signal
@@ -21,6 +20,8 @@ from lmm_serving.common.logging_config import get_logger
 from lmm_serving.common import scheduling
 from lmm_serving.common import autoscaling
 from lmm_serving.common.vision_tokens import vision_tokens
+from lmm_serving.common.resources import ProtocolError
+from lmm_serving.modserve.pipeline import ImagePipeline
 
 logger = get_logger("modserve.cluster_manager")
 
@@ -42,7 +43,9 @@ metrics_df = scheduling.request_metrics_df()
 
 image_metrics_df = pd.DataFrame(
     columns=[
+        "transfer_id",
         "req_id",
+        "image_index",
         "image_id",
         "num_image_tokens",
         "waiting_time",
@@ -51,7 +54,7 @@ image_metrics_df = pd.DataFrame(
         "e2e_time",
     ]
 )
-image_metrics_df = image_metrics_df.set_index("req_id")
+image_metrics_df = image_metrics_df.set_index("transfer_id")
 
 # text node : [image_nodes]
 modserve_text_nodes = []
@@ -97,10 +100,8 @@ app = Flask(__name__)
 
 
 def _post(url: str, payload: dict[str, Any]) -> requests.Response:
-    return scheduling.guarded_post(logger, url, payload)
+    return scheduling.guarded_post(logger, url, payload, float(cfg.MODSERVE_REQUEST_TIMEOUT_S))
 
-
-image_status_tracker = {}
 
 MODEL_ARCH = "MLLAMA" if "Llama" in cfg.MODEL else "INTERNVL"
 SCHEDULER = getattr(cfg, "SCHEDULER", "round_robin")
@@ -124,28 +125,6 @@ logger.info(
 
 def _text_load(n_text_tokens: int, n_image_tokens: int) -> int:
     return int(n_text_tokens + TEXT_IMG_WEIGHT * n_image_tokens)
-
-
-TEXT_INFLIGHT_IMAGE_TOKEN_BUDGET = int(
-    getattr(cfg, "TEXT_INFLIGHT_IMAGE_TOKEN_BUDGET", 250000)
-)
-_inflight = {}
-_inflight_cv = threading.Condition()
-
-
-def _admit_image_tokens(node_ip: str, n_image_tokens: int) -> None:
-    n = min(n_image_tokens, TEXT_INFLIGHT_IMAGE_TOKEN_BUDGET)
-    with _inflight_cv:
-        while _inflight.get(node_ip, 0) + n > TEXT_INFLIGHT_IMAGE_TOKEN_BUDGET:
-            _inflight_cv.wait()
-        _inflight[node_ip] = _inflight.get(node_ip, 0) + n
-
-
-def _release_image_tokens(node_ip: str, n_image_tokens: int) -> None:
-    n = min(n_image_tokens, TEXT_INFLIGHT_IMAGE_TOKEN_BUDGET)
-    with _inflight_cv:
-        _inflight[node_ip] = max(0, _inflight.get(node_ip, 0) - n)
-        _inflight_cv.notify_all()
 
 
 # Autoscaling stuff
@@ -205,29 +184,39 @@ def populate_metrics_df(req_id: str, vllm_req_id: str, **kwargs: Any) -> None:
     )
 
 
-def populate_image_metrics_df(
-    req_id: str,
-    image_id: str,
-    num_image_tokens: int,
-    waiting_time: float,
-    preprocessing_time: float,
-    encoding_time: float,
-    e2e_time: float,
-) -> None:
+def record_pipeline_image(plan, encoded, e2e_ms):
     with IMAGE_METRICS_DF_LOCK:
-        image_metrics_df.loc[req_id] = [
-            image_id,
-            num_image_tokens,
-            waiting_time,
-            preprocessing_time,
-            encoding_time,
-            e2e_time,
+        image_metrics_df.loc[plan["transfer_id"]] = [
+            plan["req_id"], plan["image_index"], plan["image_id"],
+            encoded["num_image_tokens"],
+            e2e_ms - encoded.get("preprocessing_time", 0) - encoded.get("image_encoding_time", 0),
+            encoded.get("preprocessing_time", 0), encoded.get("image_encoding_time", 0), e2e_ms,
         ]
+
+
+image_pipeline = ImagePipeline(
+    image_scheduler=image_node_scheduler, text_scheduler=text_node_scheduler,
+    image_ranks=image_node_ranks,
+    recv_addresses={address: (f"{address.split(':')[0]}:{int(cfg.TENSOR_TRANSFER_RECV_BASE_PORT) + j}",
+                              text_recv_rank[address])
+                    for j, address in enumerate(modserve_text_nodes)},
+    token_estimator=_image_weight, text_load=_text_load, model_arch=MODEL_ARCH,
+    timeout_s=cfg.MODSERVE_REQUEST_TIMEOUT_S,
+    max_images=min(int(cfg.MODSERVE_MAX_IMAGES), 8 if MODEL_ARCH == "MLLAMA" else 400),
+    encode_workers=cfg.MODSERVE_ENCODE_WORKERS, logger=logger,
+    image_metric=record_pipeline_image,
+)
 
 
 @app.route("/generate", methods=["POST"])
 def process_request() -> tuple[Response, int]:
     data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify(error="request must be a JSON object"), 400
+    ids = data.get("image_ids", [])
+    if (not isinstance(ids, list) or len(ids) > int(cfg.MODSERVE_MAX_IMAGES)
+            or any(not isinstance(i, str) or not i for i in ids)):
+        return jsonify(error="invalid image_ids or too many images"), 400
     e2e_start_time = time.perf_counter()
     cluster_manager_waiting_time = (
         time.perf_counter() - data.get("perf_time_start", time.perf_counter())
@@ -335,194 +324,37 @@ def process_request() -> tuple[Response, int]:
             + cluster_manager_waiting_time,
         )
 
-    # Image+text requests encode on image nodes first, then route to a text node.
+    # The production pipeline reserves Text and Image capacity before encoding.
     elif req_type == "IMAGE":
         arrival_image_tokens = sum(_image_weight(i) for i in image_ids)
         image_load_window.add(arrival_image_tokens)
         text_load_window.add(_text_load(n_text_tokens, arrival_image_tokens))
-
-        track_id = uuid.uuid4().hex
-        image_thread_list = []
-        image_processing_start_time = time.perf_counter()
-        for image_id in image_ids:
-            payload = {
-                "req_id": data["req_id"],
-                "track_id": track_id,
-                "image_id": image_id,
-            }
-
-            thread = threading.Thread(target=forward_image_request, args=(payload,))
-            image_thread_list.append(thread)
-            with DATA_LOCK:
-                image_status_tracker.setdefault(track_id, []).append(
-                    {
-                        "image_id": image_id,
-                        "num_image_tokens": 0,
-                        "image_node_ip": None,
-                        "tensor_shape": [],
-                    }
-                )
-            thread.start()
-
-        for thread in image_thread_list:
-            thread.join()
-        image_processing_end_time = time.perf_counter()
-        total_image_processing_time = (
-            image_processing_end_time - image_processing_start_time
-        ) * 1000
-
-        statuses = image_status_tracker[track_id]
-        failed = [
-            s for s in statuses if s["image_node_ip"] is None or not s["tensor_shape"]
-        ]
-        if failed:
-            logger.error(
-                "Image encoding failed req_id=%s (%d/%d images); not routing to text node",
-                req_id,
-                len(failed),
-                len(statuses),
-            )
-            populate_metrics_df(
-                req_id=req_id,
-                vllm_req_id="",
-                timestamp=timestamp,
-                num_images=len(statuses),
-                n_context_tokens=n_text_tokens,
-                n_generated_tokens=n_generated_tokens,
-                cluster_manager_waiting_time=cluster_manager_waiting_time,
-                total_image_processing_time=total_image_processing_time,
-                http_code=500,
-                e2e_time=(time.perf_counter() - e2e_start_time) * 1000
-                + cluster_manager_waiting_time,
-            )
-            with DATA_LOCK:
-                del image_status_tracker[track_id]
-            return jsonify({"req_id": req_id, "error": "image encoding failed"}), 500
-
-        image_ids = []
-        image_id_shapes = []
-        num_image_tokens = 0
-        src_ranks = []
-        image_node_source_urls = []
-        for image_status in statuses:
-            image_ids.append(image_status["image_id"])
-            image_id_shapes.append(image_status["tensor_shape"])
-            num_image_tokens += image_status["num_image_tokens"]
-            src_ranks.append(image_node_ranks[image_status["image_node_ip"]])
-            # Full host:port — the image node hosts the send endpoint on its own port.
-            image_node_source_urls.append(image_status["image_node_ip"])
-
-        text_load = _text_load(n_text_tokens, num_image_tokens)
-        node_ip_to_route = text_node_scheduler.acquire(text_load)
-        api_url = "http://" + node_ip_to_route + "/generate"
-        # Send every image to the recv rank co-located with the chosen text node.
-        dest_ranks = [text_recv_rank[node_ip_to_route]] * len(image_ids)
-        logger.info(
-            "Routing IMAGE request req_id=%s to text node %s (images=%d load=%d)",
-            req_id,
-            api_url,
-            len(statuses),
-            text_load,
-        )
-
-        payload = {
-            "req_id": req_id,
-            "prompt": data["prompt"],
-            "num_text_tokens": data["num_text_tokens"],
-            "images": image_ids,
-            "image_id_shapes": image_id_shapes,
-            "source_node_ips": image_node_source_urls,
-            "src_ranks": src_ranks,
-            "dest_ranks": dest_ranks,
-            "n": data["n"],
-            "best_of": data["best_of"],
-            "use_beam_search": data["use_beam_search"],
-            "temperature": data["temperature"],
-            "top_p": data["top_p"],
-            "max_tokens": data["max_tokens"],
-            "ignore_eos": data["ignore_eos"],
-            "stream": data["stream"],
-        }
         if INSTANCE_PRIORITY:
-            payload["priority"] = text_load
-
-        logger.debug(
-            "Sending payload to text node: req_id=%s src_ranks=%s dest_ranks=%s payload=%s",
-            req_id,
-            src_ranks,
-            dest_ranks,
-            payload,
-        )
-
-        # pool manager sitting on the same host
-
-        num_images = len(statuses)
-
-        _admit_image_tokens(node_ip_to_route, num_image_tokens)
-        # Charge the text node until it responds, then refund (least-loaded routing).
+            data["priority"] = _text_load(n_text_tokens, arrival_image_tokens)
         try:
-            response = forward_text_request(api_url, payload)
-        finally:
-            _release_image_tokens(node_ip_to_route, num_image_tokens)
-            text_node_scheduler.release(node_ip_to_route, text_load)
-
-        # Guard against a non-JSON body; keep the arrival req_id as the metric key.
-        try:
-            response_json = response.json()
-        except ValueError:
-            logger.error(
-                "Non-JSON response from text node: req_id=%s url=%s status=%s body=%.200s",
-                req_id,
-                api_url,
-                response.status_code,
-                response.text,
+            outcome = image_pipeline.run(data)
+        except ProtocolError as error:
+            populate_metrics_df(
+                req_id=req_id, vllm_req_id="", num_images=len(image_ids),
+                n_context_tokens=n_text_tokens, n_generated_tokens=n_generated_tokens,
+                http_code=error.status, e2e_time=(time.perf_counter() - e2e_start_time) * 1000,
             )
-            response_json = {}
-        vllm_req_id = response_json.get("vllm_req_id", 0)
+            return jsonify(req_id=req_id, error=str(error)), error.status
+        response_json = outcome.response
+        vllm_req_id = response_json.get("vllm_req_id", "")
         content = response_json.get("content", "")
-        vllm_processing_time = response_json.get("request_latency_ms", 0.0)
-
-        if response.status_code != 200:
-            logger.error(
-                "Text node returned error: req_id=%s status=%s url=%s num_images=%s",
-                req_id,
-                response.status_code,
-                api_url,
-                num_images,
-            )
-            populate_metrics_df(
-                req_id=req_id,
-                vllm_req_id=vllm_req_id,
-                total_image_processing_time=vllm_processing_time,
-                timestamp=timestamp,
-                num_images=num_images,
-                n_context_tokens=n_text_tokens,
-                n_generated_tokens=n_generated_tokens,
-                num_image_tokens=num_image_tokens,
-                e2e_time=(time.perf_counter() - e2e_start_time) * 1000
-                + cluster_manager_waiting_time,
-                http_code=response.status_code,
-            )
-
-        else:
-            populate_metrics_df(
-                req_id=req_id,
-                vllm_req_id=vllm_req_id,
-                timestamp=timestamp,
-                num_images=num_images,
-                n_context_tokens=n_text_tokens,
-                n_generated_tokens=n_generated_tokens,
-                num_image_tokens=num_image_tokens,
-                cluster_manager_waiting_time=cluster_manager_waiting_time,
-                total_image_processing_time=total_image_processing_time,
-                total_llm_backend_processing_time=vllm_processing_time,
-                e2e_time=(time.perf_counter() - e2e_start_time) * 1000
-                + cluster_manager_waiting_time,
-                http_code=response.status_code,
-            )
-
-        with DATA_LOCK:
-            del image_status_tracker[track_id]
+        response = requests.Response()
+        response.status_code = 200
+        populate_metrics_df(
+            req_id=req_id, vllm_req_id=vllm_req_id, timestamp=timestamp,
+            num_images=len(image_ids), n_context_tokens=n_text_tokens,
+            n_generated_tokens=n_generated_tokens,
+            num_image_tokens=sum(i["num_image_tokens"] for i in outcome.images),
+            cluster_manager_waiting_time=cluster_manager_waiting_time,
+            total_image_processing_time=outcome.image_ms,
+            total_llm_backend_processing_time=outcome.backend_ms,
+            e2e_time=(time.perf_counter() - e2e_start_time) * 1000,
+        )
 
     response_ = requests.Response()
     response_.status_code = response.status_code
@@ -530,104 +362,6 @@ def process_request() -> tuple[Response, int]:
         json.dumps({"vllm_req_id": vllm_req_id, "content": content}).encode("utf8")
     )
     return jsonify(response_.json()), response_.status_code
-
-
-def forward_image_request(payload: dict[str, Any]) -> None:
-    image_load = _image_weight(payload.get("image_id", ""))
-    image_node_ip = image_node_scheduler.acquire(image_load)
-    logger.debug(
-        "IMAGE routed: req_id=%s image_id=%s -> %s (load=%d tokens)",
-        payload.get("req_id"),
-        payload.get("image_id"),
-        image_node_ip,
-        image_load,
-    )
-    try:
-        _forward_image_request(payload, image_node_ip)
-    finally:
-        image_node_scheduler.release(image_node_ip, image_load)
-
-
-def _forward_image_request(payload: dict[str, Any], image_node_ip: str) -> None:
-    api_url = "http://" + image_node_ip + "/generate"
-
-    logger.debug(
-        "Routing image to image node: req_id=%s image_id=%s url=%s",
-        payload.get("req_id"),
-        payload.get("image_id"),
-        api_url,
-    )
-    start_request_time = time.perf_counter()
-    response = _post(api_url, payload)
-    end_request_time = time.perf_counter()
-
-    if response.status_code != 200:
-        logger.error(
-            "Image node returned error: req_id=%s status=%s url=%s",
-            payload.get("req_id"),
-            response.status_code,
-            api_url,
-        )
-
-    # get the json of response (guard against a non-JSON error body)
-    try:
-        response_json = response.json()
-    except ValueError:
-        logger.error(
-            "Non-JSON response from image node: req_id=%s url=%s status=%s body=%.200s",
-            payload.get("req_id"),
-            api_url,
-            response.status_code,
-            response.text,
-        )
-        response_json = {}
-    image_id = payload.get("image_id", "")
-    num_image_tokens = response_json.get("num_image_tokens", 0)
-    req_id = payload.get("req_id", "")
-    track_id = payload.get("track_id", req_id)
-    preprocessing_time = response_json.get("preprocessing_time", 0.0)
-    encoding_time = response_json.get("image_encoding_time", 0.0)
-    e2e_time = (end_request_time - start_request_time) * 1000
-    tensor_shape = response_json.get("tensor_shape", [])
-    waiting_time_ms = e2e_time - (preprocessing_time + encoding_time)
-
-    populate_image_metrics_df(
-        req_id=req_id,
-        image_id=image_id,
-        waiting_time=waiting_time_ms,
-        num_image_tokens=num_image_tokens,
-        preprocessing_time=preprocessing_time,
-        encoding_time=encoding_time,
-        e2e_time=e2e_time,
-    )
-
-    with DATA_LOCK:
-        for image_status in image_status_tracker[track_id]:
-            if (
-                image_status["image_id"] == image_id
-                and image_status["image_node_ip"] is None
-            ):
-                logger.debug(
-                    "Image encoded: req_id=%s image_id=%s num_image_tokens=%s",
-                    req_id,
-                    image_id,
-                    num_image_tokens,
-                )
-                image_status["num_image_tokens"] = num_image_tokens
-                image_status["image_node_ip"] = image_node_ip
-                image_status["tensor_shape"] = tensor_shape
-                break
-
-
-def forward_text_request(api_url: str, payload: dict[str, Any]) -> requests.Response:
-    logger.debug(
-        "Forwarding image-text request to text node: req_id=%s payload=%s",
-        payload.get("req_id"),
-        payload,
-    )
-    response = _post(api_url, payload)
-
-    return response
 
 
 def signal_handler(sig: int, frame: Any) -> None:

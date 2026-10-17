@@ -1,7 +1,8 @@
 import base64
 import os
 import pickle
-import queue
+import json
+from datetime import timedelta
 import signal
 import sys
 import threading
@@ -11,6 +12,9 @@ from flask import Flask, request, jsonify
 from torch.multiprocessing.reductions import reduce_tensor
 
 from lmm_serving.common.logging_config import get_logger
+from lmm_serving import config as cfg
+from lmm_serving.common.features import FeatureRegistry
+from lmm_serving.common.tensor_transfer import TorchTransport, TransferService
 
 logger = get_logger("modserve.tensor_transfer_text")
 app = Flask(__name__)
@@ -34,15 +38,12 @@ WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 N_IMAGE = int(os.environ["N_IMAGE_NODES"])
 IMAGE_RANKS = list(range(N_IMAGE))
 
-_jobs: dict = {}  # src_rank -> queue of (image_id, shape, result, done)
-_pair_group: dict = {}  # src_rank -> ProcessGroup for the (src_rank, RANK) pair
-pending: dict = {}  # image_id -> recv'd GPU tensor (kept alive until released)
-pending_lock = threading.Lock()
-RECV_TIMEOUT_S = float(os.environ.get("TENSOR_TRANSFER_TIMEOUT_S", "60"))
-
-
-def normalize_image_id(image_id: str) -> str:
-    return image_id.split(".")[0] if "." in image_id else image_id
+FEATURES = FeatureRegistry(
+    int(cfg.RECV_FEATURE_BYTE_BUDGET), int(cfg.TRANSFER_MAX_FEATURES),
+    history_s=float(cfg.MODSERVE_REQUEST_TIMEOUT_S) + 60,
+    history_limit=cfg.TRANSFER_HISTORY_LIMIT,
+)
+_transfer_service = None
 
 
 def _ipc_handle(tensor: torch.Tensor) -> str:
@@ -54,7 +55,7 @@ def _build_pair_groups():
     groups = {}
     for img in IMAGE_RANKS:
         for txt in range(N_IMAGE, WORLD_SIZE):
-            g = torch.distributed.new_group(ranks=[img, txt])
+            g = torch.distributed.new_group(ranks=[img, txt], timeout=timedelta(seconds=float(cfg.TENSOR_TRANSFER_TIMEOUT_S)))
             if RANK in (img, txt):
                 groups[(img, txt)] = g
     return groups
@@ -72,103 +73,43 @@ def _warmup_pairs(groups):
             torch.distributed.barrier()
 
 
-def recv_worker(src_rank: int, group):
-    torch.cuda.set_device(GPU)
-    while True:
-        image_id, shape, result, done = _jobs[src_rank].get()
-        try:
-            tensor = torch.empty(shape, dtype=torch.bfloat16, device=f"cuda:{GPU}")
-            torch.distributed.recv(tensor=tensor, src=src_rank, group=group)
-            with pending_lock:
-                pending[image_id] = tensor
-            result["handle"] = _ipc_handle(tensor)
-        except Exception as e:
-            logger.exception(
-                "Recv failed for image_id=%s from rank=%s", image_id, src_rank
-            )
-            result["error"] = str(e)
-        finally:
-            done.set()
-
-
 def nccl_worker():
-    torch.cuda.set_device(GPU)
-    torch.distributed.init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
-        rank=RANK,
-        world_size=WORLD_SIZE,
-    )  # NB: no device_id -- eager init uses ncclCommSplit for new_group, which
-    torch.distributed.barrier()
-    groups = _build_pair_groups()
-    _warmup_pairs(groups)
-    for src_rank in IMAGE_RANKS:
-        _jobs[src_rank] = queue.Queue()
-        _pair_group[src_rank] = groups[(src_rank, RANK)]
-        threading.Thread(
-            target=recv_worker, args=(src_rank, _pair_group[src_rank]), daemon=True
-        ).start()
-    logger.info(
-        "Tensor-transfer RECV node ready: rank=%s gpu=%s world=%s peers=%s, listening on :%s",
-        RANK,
-        GPU,
-        WORLD_SIZE,
-        len(IMAGE_RANKS),
-        os.environ.get("TENSOR_TRANSFER_PORT", "5050"),
-    )
-    _ready.set()
+    global _transfer_service
+    try:
+        torch.cuda.set_device(GPU)
+        torch.distributed.init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+            rank=RANK, world_size=WORLD_SIZE,
+            timeout=timedelta(seconds=float(cfg.NCCL_INIT_TIMEOUT_S)),
+        )
+        torch.distributed.barrier()
+        groups = _build_pair_groups()
+        _warmup_pairs(groups)
+        transport = TorchTransport(f"cuda:{GPU}", {p: groups[(p, RANK)] for p in IMAGE_RANKS})
+        sources = {int(k): v for k, v in json.loads(os.environ["IMAGE_SOURCE_URLS"]).items()}
+        _transfer_service = TransferService(
+            "receiver", RANK, IMAGE_RANKS, FEATURES, transport,
+            timeout_s=cfg.TENSOR_TRANSFER_TIMEOUT_S, queue_size=cfg.TRANSFER_QUEUE_SIZE,
+            source_urls=sources, make_handle=_ipc_handle,
+            history_s=float(cfg.MODSERVE_REQUEST_TIMEOUT_S) + 60,
+            history_limit=cfg.TRANSFER_HISTORY_LIMIT,
+        )
+        _transfer_service.install(app)
+        _ready.set()
+    except Exception:
+        logger.exception("NCCL receiver initialization failed")
+        os._exit(1)
 
 
 _ready = threading.Event()
 
 
-@app.route("/initiate_tensor_transfer_text_node", methods=["POST"])
-def initiate():
-    data = request.get_json()
-    image_id = normalize_image_id(data.get("image_id", ""))
-    shape = data.get("tensor_shape", [])
-    src_rank = data.get("src_rank", 0)
-
-    if not shape or any(int(d) <= 0 for d in shape):
-        return (
-            jsonify({"image_id": image_id, "error": f"invalid tensor_shape={shape}"}),
-            400,
-        )
-
-    result, done = {}, threading.Event()
-    q = _jobs.get(src_rank)
-    if q is None:
-        return (
-            jsonify(
-                {
-                    "image_id": image_id,
-                    "error": f"no recv worker for src_rank={src_rank}",
-                }
-            ),
-            500,
-        )
-    q.put((image_id, shape, result, done))
-    if not done.wait(timeout=RECV_TIMEOUT_S):
-        return jsonify({"image_id": image_id, "error": "recv timed out"}), 504
-    if "error" in result:
-        return jsonify({"image_id": image_id, "error": result["error"]}), 500
-    logger.debug(
-        "Received image_id=%s from rank=%s; returning IPC handle", image_id, src_rank
-    )
-    return jsonify({"image_id": image_id, "ipc_handle": result["handle"]}), 200
-
-
-@app.route("/release_tensor", methods=["POST"])
-def release():
-    image_id = normalize_image_id(request.get_json().get("image_id", ""))
-    with pending_lock:
-        pending.pop(image_id, None)
-    return jsonify({"image_id": image_id}), 200
-
-
 def signal_handler(*_):
     logger.info("Shutting down tensor-transfer RECV node")
     try:
+        if _transfer_service:
+            _transfer_service.close()
         torch.distributed.destroy_process_group()
     except Exception:
         pass

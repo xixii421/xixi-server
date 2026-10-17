@@ -1,6 +1,6 @@
 # ModServe 单卡学习版：改造计划
 
-> 状态：规划完成，尚未开始单卡实现。以 [Azure/ModServe](https://github.com/Azure/ModServe) 的 `c7a3e9ac116b735b14bfaeaf575ee048b4c02c23` 为起点，保留原始 Git 历史与 MIT 许可证。本文件是后续改造的执行清单；完成一个关口后，更新复选框、实测数据和决策记录。
+> 状态：2026-10-15 已落地 M1 的 CPU/Gloo 模拟学习链路，真实单卡推理尚未实现。见 [运行指南](docs/single_gpu_learning.md) 和 [进度记录](docs/single_gpu_progress.md)。以 [Azure/ModServe](https://github.com/Azure/ModServe) 的 `c7a3e9ac116b735b14bfaeaf575ee048b4c02c23` 为起点，保留原始 Git 历史与 MIT 许可证。
 
 ## 目标与验收口径
 
@@ -32,19 +32,19 @@
 
 ### M0：冻结基线与环境探测
 
-- [ ] 记录 WSL、NVIDIA 驱动/CUDA、Python、PyTorch、显存与空闲磁盘；保存命令和结果到 `docs/single_gpu_progress.md`。不将模型权重、缓存和私有数据提交到 Git。
-- [ ] 跑现有轻量测试（拓扑、调度、autoscaling）；记录通过/失败及依赖问题。暂不安装或启动 11B 默认栈。
-- [ ] 固定原项目 `main` 行为：新路径用独立配置开关和文件实现，原多 GPU 配置及测试继续有效。
+- [x] 记录 WSL、Python、CPU PyTorch、空闲磁盘及 GPU 探测受限原因，保存到 `docs/single_gpu_progress.md`；未测得的 GPU 信息明确标记。不提交模型权重、缓存和私有数据。
+- [x] 跑现有轻量测试（拓扑、调度、autoscaling、profiler），共 70 项检查通过。未安装或启动 11B 默认栈。
+- [x] 新路径用独立配置和文件实现；调度器抽成轻量公共模块并保持原导入 API，原多 GPU 配置及测试继续有效。
 
 **完成条件**：有可复现的环境记录和基线测试结果，知道单卡启动前需要的依赖。
 
 ### M1：无 GPU 的端到端模拟链路
 
-- [ ] 定义 `single_gpu_mock` 模式与单机拓扑：一个 Cluster Manager、一个 mock Image Instance、一个 mock Text Instance；保留原有多 GPU 拓扑校验。
-- [ ] 让 mock Image Instance 返回带请求 ID、图像 ID、形状与耗时的**可识别模拟特征**；mock Text Instance 接收同一请求的特征元数据并返回确定性文本。纯文本请求绕过 Image Instance。
-- [ ] 对两条路径进行端到端验证：纯文本直接到 Text，单图走 Image→Text；同时覆盖多图、找不到图片、超时、重复 ID、实例失败与完成后清理。
-- [ ] 输出每次请求的排队、预处理、编码、传输、prefill、decode 耗时字段；mock 值须明确标记，避免和 GPU 实测混淆。
-- [ ] 增加一条最小启动命令、一个纯文本样例和一个单图样例，均无需下载模型即可运行。
+- [x] 定义 `single_gpu_mock` 模式与独立单机配置：一个 Cluster Manager、一个 mock Image Instance、一个 mock Text Instance；保留原有多 GPU 拓扑校验。
+- [x] mock Image 读取图片字节构造确定性特征，带独立传输 ID、图像 ID、形状、校验和与耗时；通过真实 CPU/Gloo 传给 Text 进程校验、消费并返回确定性文本。纯文本绕过 Image。
+- [x] 端到端覆盖纯文本、单图、多图、并发重复图片、找不到图片、超时、重复请求 ID、实例失败与完成后清理。
+- [x] 输出排队、预处理、模拟编码、实际传输耗时；prefill/decode 标为占位 0，记录明确携带 mock 模式和模拟阶段，避免与 GPU 实测混淆。
+- [x] 提供 `python -m lmm_serving.launcher learn --demo`、纯文本和单图样例；演示图片在临时目录生成，无需模型下载。
 
 **完成条件**：从客户端到两个逻辑池的请求链路可一键复现，自动化测试验证路由、特征归属、错误传播和资源释放。此阶段不声称完成真实图文推理。
 

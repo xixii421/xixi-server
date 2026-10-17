@@ -5,6 +5,8 @@ import sys
 from lmm_serving import config as cfg
 from lmm_serving.common.logging_config import get_logger
 from lmm_serving.common import text_node
+from lmm_serving.common.admission import TextAdmission
+from lmm_serving.common.resources import ProtocolError
 
 logger = get_logger("modserve.text_node")
 
@@ -97,12 +99,20 @@ def _image_content(data: dict) -> list:
     src_ranks = data.get("src_ranks", [])
     dest_ranks = data.get("dest_ranks", [])
     source_urls = data.get("source_node_ips", [])
+    transfer_ids = data["transfer_ids"] if image_ids else []
+    dtypes = data.get("transfer_dtypes", ["bfloat16"] * len(image_ids))
+    if any(len(items) != len(image_ids) for items in (
+        shapes, src_ranks, dest_ranks, source_urls, transfer_ids, dtypes,
+    )) or len(set(transfer_ids)) != len(transfer_ids):
+        raise ProtocolError("inconsistent multimodal transfer metadata")
     return [
         {
             "type": "decoupled-multimodal-images",
             "image": {
                 "model": MODEL_ARCH,
-                "image_id": image_id,
+                "image_id": transfer_ids[idx],
+                "request_id": data["request_id"],
+                "dtype": dtypes[idx],
                 "source_url": source_urls[idx],
                 "image_tensor_shape": shapes[idx],
                 "src_rank": src_ranks[idx],
@@ -147,4 +157,9 @@ if __name__ == "__main__":
         err_log=f"{logdir}/vllm-error-{HOSTNAME}-{PORT}.log",
         image_content=_image_content,
         priority_enabled=INSTANCE_PRIORITY,
+        admission=TextAdmission(
+            cfg.TEXT_INFLIGHT_IMAGE_TOKEN_BUDGET, cfg.TEXT_FEATURE_BYTE_BUDGET,
+            cfg.TEXT_MAX_IMAGE_REQUESTS, history_s=float(cfg.MODSERVE_REQUEST_TIMEOUT_S) + 60,
+            history_limit=cfg.TRANSFER_HISTORY_LIMIT,
+        ),
     )

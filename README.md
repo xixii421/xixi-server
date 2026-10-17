@@ -1,5 +1,31 @@
-> **Single-GPU learning adaptation (work in progress).** This repository preserves the upstream ModServe implementation and history. The original multi-GPU setup below is not yet runnable on one 8 GiB GPU. See [SINGLE_GPU_PLAN.md](SINGLE_GPU_PLAN.md) for the adaptation scope and milestones. Upstream: [Azure/ModServe](https://github.com/Azure/ModServe).
+> **单卡学习模式已可运行：** 使用 CPU/Gloo 保留独立 Cluster、Image、Text 进程和真实张量通信，无需 GPU、模型权重或 vLLM；编码与文本生成明确标记为模拟。真实单卡推理仍未实现。原始多卡实现和历史保留，见 [学习指南](docs/single_gpu_learning.md)、[改造计划](SINGLE_GPU_PLAN.md)。Upstream: [Azure/ModServe](https://github.com/Azure/ModServe).
 # ModServe
+
+## CPU / single-GPU learning quickstart
+
+在仓库根目录运行（Linux / WSL，Python 3.10+）：
+
+```bash
+# 独立轻量环境；无需执行下面原版安装流程中的 pixi run setup。
+uv venv .venv --python python3
+uv pip install --python .venv/bin/python -r requirements-learning.txt
+
+# 自动启动三个角色，执行纯文本和临时生成的图片请求，再退出。
+PYTHONPATH=src .venv/bin/python -m lmm_serving.launcher learn --demo
+
+# 常驻服务；另开终端发送请求，Ctrl+C 关闭所有子进程。
+PYTHONPATH=src .venv/bin/python -m lmm_serving.launcher learn --image-dir /path/to/images
+```
+
+```bash
+curl -s http://127.0.0.1:7070/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"描述图片","image_ids":["your-image.jpg"]}'
+```
+
+Image rank 0 → Gloo → Text rank 1；返回值包含特征 ID、校验和、路由和耗时，输出以 `[MOCK]` 开头。指标追加到 `metrics/single_gpu_mock/requests.jsonl`。完整配置、纯文本样例、故障行为及测试命令见 [单卡学习指南](docs/single_gpu_learning.md)。以下为原始多 GPU 版本文档。
+
+> **原版 ModServe 协议更新：** 已接入请求级特征 ID、接收端统一排序、IPC 单消费者 lease，以及编码前的 token/字节预算。需要同步更新所有节点并重建 vLLM 补丁；部署、测试和 GPU 验证边界见 [可靠传输与资源背压](docs/modserve_reliability.md)。
 
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![vLLM Backend](https://img.shields.io/badge/backend-vLLM-orange.svg)](https://github.com/vllm-project/vllm)
@@ -164,6 +190,8 @@ python -m lmm_serving.launcher validate modserve   # or: monolith
 
 ## Project Structure
 
+中文目录职责及可清理内容见 [项目目录说明](docs/project_structure.md)。
+
 ```
 ├── src/lmm_serving/          # Main package
 │   ├── config/               # config.yaml + loader
@@ -174,13 +202,14 @@ python -m lmm_serving.launcher validate modserve   # or: monolith
 │   ├── monolith/             # Monolithic serving components
 │   │   └── components/       # cluster_manager, text node manager
 │   ├── profiler/             # Latency profiling + RF model fitting
-│   └── experiments/          # Ablation runner + scoring
+│   └── learning/             # CPU/Gloo teaching runtime (simulated model)
 ├── client/                   # Trace replay client
 ├── configs/                  # Topology YAML files (modserve/ and monolith/)
+├── profiles/                 # Upstream reference model capacities
+├── traces/                   # Small replay inputs and scaled request traces
 ├── llm-backend/              # Patched vLLM build script + patch file
 ├── utils/                    # Setup, trace fetch/staging, cleanup scripts
 ├── tests/                    # Unit tests (topology, scheduling, autoscaling, profiler)
-├── notebooks/                # Evaluation notebooks
 ├── docs/                     # Detailed documentation
 ├── pixi.toml                 # Pixi workspace definition
 ├── pyproject.toml            # Python package metadata
@@ -205,7 +234,7 @@ python tests/test_profiler.py      #  2 tests — RF model capacity
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | Every `config.yaml` parameter explained |
 | [docs/topology.md](docs/topology.md) | Writing `configs/<setup>/nodes_*.yaml` cluster topologies |
-| [docs/experiments.md](docs/experiments.md) | End-to-end pipeline: profiling → traces → runs → ablation → plots |
+| [docs/experiments.md](docs/experiments.md) | Profiling, trace preparation, replay and metrics collection |
 
 ## Troubleshooting
 

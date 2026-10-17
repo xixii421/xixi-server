@@ -269,13 +269,15 @@ index 3a6e75b1d..2df4f9496 100644
  
  logger = init_logger(__name__)
  
-@@ -80,6 +90,18 @@ class CustomChatCompletionContentSimpleImageParam(TypedDict, total=False):
+@@ -80,6 +90,20 @@ class CustomChatCompletionContentSimpleImageParam(TypedDict, total=False):
      """
      image_url: Required[str]
  
 +class DecoupledImage(TypedDict, total=False):
 +    model: Required[str]
-+    image_id: Required[str]
++    image_id: Required[str]  # opaque transfer_id, never a filename
++    request_id: Required[str]
++    dtype: Required[str]
 +    source_url: Required[str]
 +    image_tensor_shape: Required[List[int]]
 +    src_rank: Required[int]
@@ -288,7 +290,7 @@ index 3a6e75b1d..2df4f9496 100644
  
  class CustomChatCompletionContentSimpleAudioParam(TypedDict, total=False):
      """A simpler version of the param that only accepts a plain audio_url.
-@@ -106,6 +128,7 @@ class CustomChatCompletionContentSimpleVideoParam(TypedDict, total=False):
+@@ -106,6 +130,7 @@ class CustomChatCompletionContentSimpleVideoParam(TypedDict, total=False):
  ChatCompletionContentPartParam: TypeAlias = Union[
      OpenAIChatCompletionContentPartParam, ChatCompletionContentPartAudioParam,
      ChatCompletionContentPartInputAudioParam,
@@ -296,7 +298,7 @@ index 3a6e75b1d..2df4f9496 100644
      ChatCompletionContentPartVideoParam, ChatCompletionContentPartRefusalParam,
      CustomChatCompletionContentSimpleImageParam,
      CustomChatCompletionContentSimpleAudioParam,
-@@ -478,10 +501,11 @@ class AsyncMultiModalItemTracker(BaseMultiModalItemTracker[Awaitable[object]]):
+@@ -478,10 +503,11 @@ class AsyncMultiModalItemTracker(BaseMultiModalItemTracker[Awaitable[object]]):
  
      async def all_mm_data(self) -> Optional[MultiModalDataDict]:
          if self._items_by_modality:
@@ -309,38 +311,34 @@ index 3a6e75b1d..2df4f9496 100644
  
          return None
  
-@@ -507,6 +531,11 @@ class BaseMultiModalContentParser(ABC):
+@@ -507,6 +533,11 @@ class BaseMultiModalContentParser(ABC):
      @abstractmethod
      def parse_image(self, image_url: str) -> None:
          raise NotImplementedError
 +    
 +    @abstractmethod
-+    def initiate_rdma_transfer_of_image_tokens(self, model: str, image_id: str, source_url: str, tensor_shape: List[int], src_rank: int, dest_rank: int) -> None:
++    def initiate_rdma_transfer_of_image_tokens(self, model: str, image_id: str, source_url: str, tensor_shape: List[int], src_rank: int, dest_rank: int, request_id: str, dtype: str) -> None:
 +        # RDMA logic goes here
 +        raise NotImplementedError
  
      @abstractmethod
      def parse_audio(self, audio_url: str) -> None:
-@@ -537,6 +566,13 @@ class MultiModalContentParser(BaseMultiModalContentParser):
+@@ -537,6 +568,10 @@ class MultiModalContentParser(BaseMultiModalContentParser):
  
          placeholder = self._tracker.add("image", image)
          self._add_placeholder(placeholder)
 +    
-+    def initiate_rdma_transfer_of_image_tokens(self, model: str, image_id: str, source_url: str, tensor_shape: List[int], src_rank: int, dest_rank: int) -> None:
++    def initiate_rdma_transfer_of_image_tokens(self, model: str, image_id: str, source_url: str, tensor_shape: List[int], src_rank: int, dest_rank: int, request_id: str, dtype: str) -> None:
 +
-+        # RDMA logic goes here
-+        list_of_image_tokens = torch.rand((1, 1601, 4096), dtype=torch.bfloat16) # TODO: stub, rdma should be called here
-+        placeholder = self._tracker.add("image", list_of_image_tokens)
-+        self._add_placeholder(placeholder)
++        raise ValueError("Decoupled images require the asynchronous transfer parser")
  
      def parse_audio(self, audio_url: str) -> None:
          audio = self._connector.fetch_audio(audio_url)
-@@ -567,12 +603,144 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
+@@ -567,12 +602,81 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
          self._connector = MediaConnector(
              allowed_local_media_path=tracker.allowed_local_media_path,
          )
-+        self._rdma_lock_list = [asyncio.Lock()] * 8
-+        self._rdma_timeout = 100 # seconds
++        self._rdma_timeout = float(os.environ.get("TENSOR_TRANSFER_TIMEOUT_S", "60")) + 10
 +        
  
      def parse_image(self, image_url: str) -> None:
@@ -371,116 +369,54 @@ index 3a6e75b1d..2df4f9496 100644
 +            raise # Re-raise
 +
 +
-+    async def send_rdma(self, session: aiohttp.ClientSession, source_url: str, payload: dict, image_id: str):
-+        logger.debug(f"Attempting to trigger source {source_url} for image_id: {image_id}")
-+        try:
-+            async with session.post(source_url,
-+                                    json=payload,
-+                                    timeout=aiohttp.ClientTimeout(total=self._rdma_timeout)) as response:
-+                if response.status != 200:
-+                    response_text = await response.text()
-+                    logger.error(f"Failed to trigger source node {source_url} for image_id: {image_id}. Status: {response.status}, Response: {response_text}")
-+                    # Specific error for this step
-+                    raise ValueError(f"Source trigger failed: {response.status} - {response_text}")
-+                else:
-+                    logger.debug(f"Source node {source_url} successfully signaled for image_id: {image_id}")
-+                    return True # Indicates success
-+        except asyncio.TimeoutError:
-+            logger.error(f"Timeout ({self._rdma_timeout}s) triggering source node {source_url} for image_id: {image_id}.")
-+            raise # Re-raise
-+        except aiohttp.ClientError as e:
-+            logger.error(f"ClientError triggering source node {source_url} for image_id: {image_id}: {e}")
-+            raise # Re-raise
++    async def do_rdma(self, model: str, image_id: str, source_node: str, tensor_shape: List[int], src_rank: int, dest_rank: int, request_id: str, dtype: str):
++        # Protocol v2: the receiver owns the pair queue and triggers the sender.
++        # Independent HTTP calls from separate frontends cannot order a channel.
++        transfer_id = image_id
++        recv_port = os.environ.get("TENSOR_TRANSFER_RECV_PORT", "5051")
++        dest_url = f"http://127.0.0.1:{recv_port}/initiate_tensor_transfer_text_node"
++        payload = {
++            "protocol_version": 2, "transfer_id": transfer_id,
++            "request_id": request_id, "source_url": source_node,
++            "tensor_shape": tensor_shape, "dtype": dtype,
++            "src_rank": src_rank, "dest_rank": dest_rank,
++            "timeout_s": self._rdma_timeout - 10,
++        }
++        async with aiohttp.ClientSession() as session:
++            recv_result = await self.recv_rdma(session, dest_url, payload, transfer_id)
++            try:
++                args = pickle.loads(base64.b64decode(recv_result["ipc_handle"]))
++                image_tokens = rebuild_cuda_tensor(*args).clone()
++                # Keep the receiver's IPC allocation alive until the copy is
++                # complete. If mapping/copy/sync fails, do NOT acknowledge it:
++                # the receiver pins the lease until a controlled stack restart.
++                torch.cuda.current_stream().synchronize()
++            except Exception as e:
++                raise ValueError(f"Failed IPC copy for transfer {transfer_id}: {e}") from e
++            await self._release_rdma(session, recv_port, transfer_id, recv_result["lease_token"])
++        if model == "INTERNVL":
++            image_tokens = image_tokens.reshape(-1, 6144)
++        elif model == "MLLAMA":
++            image_tokens = image_tokens.reshape(-1, 4096)
++        return image_tokens
 +
-+    def normalize_image_id(self, image_id: str):
-+        if image_id.find('.') == -1:
-+            return image_id
-+        else:
-+            return image_id[:image_id.find('.')]
-+    
-+    async def do_rdma(self, model: str, image_id: str, source_node:str, tensor_shape: List[int], src_rank: int, dest_rank: int):  # RDMA transfer of image tokens from image nodes
-+        async with self._rdma_lock_list[src_rank % 8]:
-+            image_id = self.normalize_image_id(image_id)
-+            # The image node hosts the send endpoint on its own host:port (source_node);
-+            # the recv node runs on this text host (port via env, defaults to 5050).
-+            recv_port = os.environ.get("TENSOR_TRANSFER_RECV_PORT", "5050")
-+            source_url = f"http://{source_node}/initiate_tensor_transfer_image_node"
-+            dest_url = f'http://127.0.0.1:{recv_port}/initiate_tensor_transfer_text_node'
-+            source_payload = {
-+                "image_id": image_id,
-+                "src_rank": src_rank,
-+                "dest_rank": dest_rank
-+            }
-+            dest_payload = {
-+                "image_id": image_id,
-+                "tensor_shape": tensor_shape,
-+                "src_rank": src_rank,
-+                "dest_rank": dest_rank
-+            }
-+            
-+            async with aiohttp.ClientSession() as session:
-+                try:
-+                    logger.debug(f"Initiating destination preparation and source trigger concurrently for image_id: {image_id}.")
-+                    # Both run concurrently; gather propagates the first exception.
-+                    # recv returns a CUDA IPC handle for the received tensor.
-+                    recv_result, _ = await asyncio.gather(
-+                        self.recv_rdma(session, dest_url, dest_payload, image_id),
-+                        self.send_rdma(session, source_url, source_payload, image_id)
-+                    )
-+                    logger.debug(f"Both destination preparation and source trigger were successful for image_id: {image_id}.")
-+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-+                    logger.error(f"RDMA signaling failed during concurrent execution for image_id {image_id}: {type(e).__name__} - {e}")
-+                    raise
-+
-+                # Map the recv node's tensor via CUDA IPC, copy into our own memory,
-+                # then release it on the recv side. No disk round-trip.
-+                #
-+                # The clone is an async copy on the current stream. _release_rdma
-+                # tells the recv process to free the source tensor, and under memory
-+                # pressure the CUDA allocator reuses that block immediately — so the
-+                # copy MUST finish before we signal release, or the clone reads freed
-+                # memory (intermittent "illegal memory access", load-dependent). This
-+                # runs in the API-server frontend, a separate process from the engine
-+                # worker, so syncing this stream does not stall LLM compute; it only
-+                # waits for this ~tens-of-microseconds copy.
-+                try:
-+                    args = pickle.loads(base64.b64decode(recv_result["ipc_handle"]))
-+                    image_tokens = rebuild_cuda_tensor(*args).clone()
-+                    torch.cuda.current_stream().synchronize()
-+                except Exception as e:
-+                    raise ValueError(f"Failed to map IPC tensor for image_id {image_id}: {e}")
-+                finally:
-+                    await self._release_rdma(session, recv_port, image_id)
-+
-+            # Flatten to (num_image_tokens, hidden); the image node already
-+            # projected to each model's cross-attention / context hidden size.
-+            if model == "INTERNVL":
-+                image_tokens = image_tokens.reshape(-1, 6144)
-+            elif model == "MLLAMA":
-+                image_tokens = image_tokens.reshape(-1, 4096)
-+            return image_tokens
-+
-+    async def _release_rdma(self, session: aiohttp.ClientSession, recv_port: str, image_id: str):
-+        """Tell the recv node it can free the received tensor (we've cloned it)."""
++    async def _release_rdma(self, session, recv_port, transfer_id, lease_token):
 +        url = f"http://127.0.0.1:{recv_port}/release_tensor"
-+        try:
-+            async with session.post(url, json={"image_id": image_id},
-+                                    timeout=aiohttp.ClientTimeout(total=self._rdma_timeout)) as response:
-+                await response.read()
-+        except Exception as e:
-+            logger.warning(f"release_tensor failed for image_id {image_id}: {e}")
++        async with session.post(url, json={"transfer_id": transfer_id, "lease_token": lease_token},
++                                timeout=aiohttp.ClientTimeout(total=self._rdma_timeout)) as response:
++            if response.status != 200:
++                raise ValueError(f"IPC release failed for {transfer_id}: {response.status}")
 +
-+    async def fetch_tokens(self, model: str, image_id: str, source_url: str, tensor_shape: List[int], src_rank: int, dest_rank: int):
-+        return await self.do_rdma(model, image_id, source_url, tensor_shape, src_rank, dest_rank)
++    async def fetch_tokens(self, model: str, image_id: str, source_url: str, tensor_shape: List[int], src_rank: int, dest_rank: int, request_id: str, dtype: str):
++        return await self.do_rdma(model, image_id, source_url, tensor_shape, src_rank, dest_rank, request_id, dtype)
 +
-+    def initiate_rdma_transfer_of_image_tokens(self, model: str, image_id: str, source_url: str, tensor_shape: List[int], src_rank: int, dest_rank: int) -> None:
-+        # RDMA logic goes here
-+        placeholder = self._tracker.add("image", self.fetch_tokens(model, image_id, source_url, tensor_shape, src_rank, dest_rank))
++    def initiate_rdma_transfer_of_image_tokens(self, model: str, image_id: str, source_url: str, tensor_shape: List[int], src_rank: int, dest_rank: int, request_id: str, dtype: str) -> None:
++        placeholder = self._tracker.add("image", self.fetch_tokens(model, image_id, source_url, tensor_shape, src_rank, dest_rank, request_id, dtype))
 +        self._add_placeholder(placeholder)
  
      def parse_audio(self, audio_url: str) -> None:
          audio_coro = self._connector.fetch_audio_async(audio_url)
-@@ -675,16 +843,18 @@ def _get_full_multimodal_text_prompt(placeholder_counts: Dict[str, int],
+@@ -675,16 +779,18 @@ def _get_full_multimodal_text_prompt(placeholder_counts: Dict[str, int],
      # the prompt. This may change to be customizable in the future.
      return "\n".join(missing_placeholders + [text_prompt])
  
@@ -501,7 +437,7 @@ index 3a6e75b1d..2df4f9496 100644
  
  # Define a mapping from part types to their corresponding parsing functions.
  MM_PARSER_MAP: Dict[
-@@ -695,6 +865,8 @@ MM_PARSER_MAP: Dict[
+@@ -695,6 +801,8 @@ MM_PARSER_MAP: Dict[
      lambda part: _TextParser(part).get("text", ""),
      "image_url":
      lambda part: _ImageParser(part).get("image_url", {}).get("url", ""),
@@ -510,7 +446,7 @@ index 3a6e75b1d..2df4f9496 100644
      "audio_url":
      lambda part: _AudioParser(part).get("audio_url", {}).get("url", ""),
      "input_audio":
-@@ -763,7 +935,7 @@ def _parse_chat_message_content_mm_part(
+@@ -763,7 +871,7 @@ def _parse_chat_message_content_mm_part(
      return part_type, "unknown part_type content"
  
  
@@ -519,7 +455,7 @@ index 3a6e75b1d..2df4f9496 100644
                                         "audio_url", "input_audio", "video_url")
  
  
-@@ -777,7 +949,6 @@ def _parse_chat_message_content_parts(
+@@ -777,7 +885,6 @@ def _parse_chat_message_content_parts(
      content = list[_ContentPart]()
  
      mm_parser = mm_tracker.create_parser()
@@ -527,7 +463,7 @@ index 3a6e75b1d..2df4f9496 100644
      for part in parts:
          parse_res = _parse_chat_message_content_part(
              part,
-@@ -819,6 +990,7 @@ def _parse_chat_message_content_part(
+@@ -819,6 +926,7 @@ def _parse_chat_message_content_part(
      # Handle structured dictionary parts
      part_type, content = _parse_chat_message_content_mm_part(part)
  
@@ -535,7 +471,7 @@ index 3a6e75b1d..2df4f9496 100644
      # if part_type is text/refusal/image_url/audio_url/video_url/input_audio but
      # content is empty, log a warning and skip
      if part_type in VALID_MESSAGE_CONTENT_MM_PART_TYPES and not content:
-@@ -838,6 +1010,16 @@ def _parse_chat_message_content_part(
+@@ -838,6 +946,18 @@ def _parse_chat_message_content_part(
          str_content = cast(str, content)
          mm_parser.parse_image(str_content)
          return {'type': 'image'} if wrap_dicts else None
@@ -547,12 +483,14 @@ index 3a6e75b1d..2df4f9496 100644
 +                                                         decoupled_image_info['source_url'],
 +                                                         decoupled_image_info['image_tensor_shape'],
 +                                                         decoupled_image_info['src_rank'],
-+                                                         decoupled_image_info['dest_rank'])
++                                                         decoupled_image_info['dest_rank'],
++                                                         decoupled_image_info['request_id'],
++                                                         decoupled_image_info['dtype'])
 +        return {'type': 'image'} if wrap_dicts else None
  
      if part_type == "audio_url":
          str_content = cast(str, content)
-@@ -922,8 +1104,8 @@ def parse_chat_messages(
+@@ -922,8 +1042,8 @@ def parse_chat_messages(
      content_format: _ChatTemplateContentFormat,
  ) -> Tuple[List[ConversationMessage], Optional[MultiModalDataDict]]:
      conversation: List[ConversationMessage] = []
@@ -563,7 +501,7 @@ index 3a6e75b1d..2df4f9496 100644
      for msg in messages:
          sub_messages = _parse_chat_message_content(
              msg,
-@@ -946,7 +1128,6 @@ def parse_chat_messages_futures(
+@@ -946,7 +1066,6 @@ def parse_chat_messages_futures(
  ) -> Tuple[List[ConversationMessage], Awaitable[Optional[MultiModalDataDict]]]:
      conversation: List[ConversationMessage] = []
      mm_tracker = AsyncMultiModalItemTracker(model_config, tokenizer)

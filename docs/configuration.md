@@ -26,9 +26,15 @@ file**, so you can override per-run: `MODEL=... TEXT_GPU_UTIL=0.8 pixi run ...`.
 | `NODES_CONFIG` | `local.yaml` | topology under `configs/<setup>/` |
 
 ## Tensor transfer + NCCL (modserve, multi-box)
+
+Protocol v2 now adds request-scoped features, receiver-owned ordering and early
+resource admission. See [production reliability and backpressure](modserve_reliability.md)
+for all budgets, lifecycle rules, upgrade requirements and validation limits.
+
 | Key | Default | Notes |
 |---|---|---|
 | `TENSOR_TRANSFER_PORT` | `5050` | base recv port |
+| `TENSOR_TRANSFER_RECV_BASE_PORT` | `5051` | launcher/cluster receiver base, increments per Text instance |
 | `NCCL_MASTER_ADDR` / `NCCL_MASTER_PORT` | `127.0.0.1` / `29500` | set ADDR to box-1's eth0 IP for multi-box |
 | `NCCL_SOCKET_IFNAME` | `eth0` | bootstrap NIC |
 | `NCCL_IB_HCA` | `mlx5_ib0..7` | IB devices |
@@ -41,7 +47,7 @@ file**, so you can override per-run: `MODEL=... TEXT_GPU_UTIL=0.8 pixi run ...`.
 | `TEXT_SCHEDULER` | `least_loaded` | text-node routing |
 | `INSTANCE_SCHEDULING` | `priority` | in-node: `fcfs` \| `priority` (SLO-driven) |
 | `TEXT_GPU_UTIL` | `0.90` | text KV-cache fraction |
-| `TEXT_INFLIGHT_IMAGE_TOKEN_BUDGET` | `120000` | backpressure cap on admitted image tokens |
+| `TEXT_INFLIGHT_IMAGE_TOKEN_BUDGET` | `90000` | authoritative Text-node budget, reserved before encoding; oversized requests rejected |
 | `TEXT_MAX_MODEL_LEN` | `16384` | cap so KV fits at low TP (empty = 32768) |
 | `TEXT_MAX_NUM_SEQS` | `` | empty = per-model default |
 | `TEXT_PREEMPTION_MODE` | `` | empty = vLLM default; `swap` avoids recompute re-issuing transfers |

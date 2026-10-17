@@ -23,6 +23,7 @@ NODES_CONFIG: local.yaml
 
 # Disaggregated serving. For multi-box, set NCCL_MASTER_ADDR to box-1's eth0 IP.
 TENSOR_TRANSFER_PORT: 5050
+TENSOR_TRANSFER_RECV_BASE_PORT: 5051
 NCCL_MASTER_ADDR: 127.0.0.1
 NCCL_MASTER_PORT: 29500
 
@@ -31,6 +32,22 @@ NCCL_SOCKET_IFNAME: eth0
 NCCL_IB_HCA: mlx5_ib0,mlx5_ib1,mlx5_ib2,mlx5_ib3,mlx5_ib4,mlx5_ib5,mlx5_ib6,mlx5_ib7
 # Force NCCL TCP instead of IB (set when boxes can't RDMA across subnets).
 NCCL_IB_DISABLE: false
+
+# Production protocol v2: all nodes and the vLLM patch must be upgraded together.
+MODSERVE_REQUEST_TIMEOUT_S: 600
+TENSOR_TRANSFER_TIMEOUT_S: 60
+NCCL_INIT_TIMEOUT_S: 1800
+TRANSFER_QUEUE_SIZE: 64
+TRANSFER_MAX_FEATURES: 128
+TRANSFER_HISTORY_LIMIT: 65536
+MODSERVE_MAX_IMAGES: 128
+MODSERVE_ENCODE_WORKERS: 8
+# Payload buffers only; model weights, KV cache and encoder activations are extra.
+IMAGE_FEATURE_BYTE_BUDGET: 1073741824
+RECV_FEATURE_BYTE_BUDGET: 1073741824
+# Text admission charges 2x payload bytes for receive/IPC-clone overlap.
+TEXT_FEATURE_BYTE_BUDGET: 2147483648
+TEXT_MAX_IMAGE_REQUESTS: 128
 
 SCHEDULER: least_loaded
 TEXT_SCHEDULER: least_loaded

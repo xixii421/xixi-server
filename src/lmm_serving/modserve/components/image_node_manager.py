@@ -6,10 +6,13 @@ import threading
 import subprocess
 import json
 import os
-import queue
+from datetime import timedelta
 import numpy as np
 
 from lmm_serving import config as cfg
+from lmm_serving.common.features import FeatureRegistry, transfer_key
+from lmm_serving.common.resources import ProtocolError
+from lmm_serving.common.tensor_transfer import TorchTransport, TransferService
 from lmm_serving.common.logging_config import get_logger
 from lmm_serving.common.vision_tokens import (
     calculate_internvl_targets,
@@ -156,25 +159,20 @@ WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 N_IMAGE = int(os.environ["N_IMAGE_NODES"])
 TEXT_RANKS = list(range(N_IMAGE, WORLD_SIZE))
 
-_send_jobs: dict = {}  # dest_rank -> queue of (image_id, result, done_event)
-_pair_group: dict = (
-    {}
-)  # dest_rank -> ProcessGroup for the (IMAGE_NODE_RANK, dest_rank) pair
-pending: dict = {}  # normalized image_id -> encoded GPU tensor
-pending_lock = threading.Lock()
+FEATURES = FeatureRegistry(
+    int(cfg.IMAGE_FEATURE_BYTE_BUDGET), int(cfg.TRANSFER_MAX_FEATURES),
+    history_s=float(cfg.MODSERVE_REQUEST_TIMEOUT_S) + 60,
+    history_limit=cfg.TRANSFER_HISTORY_LIMIT,
+)
 _nccl_ready = threading.Event()
-SEND_TIMEOUT_S = float(os.environ.get("TENSOR_TRANSFER_TIMEOUT_S", "60"))
-
-
-def normalize_image_id(image_id: str) -> str:
-    return image_id.split(".")[0] if "." in image_id else image_id
+_transfer_service = None
 
 
 def _build_pair_groups():
     groups = {}
     for img in range(N_IMAGE):
         for txt in TEXT_RANKS:
-            g = torch.distributed.new_group(ranks=[img, txt])
+            g = torch.distributed.new_group(ranks=[img, txt], timeout=timedelta(seconds=float(cfg.TENSOR_TRANSFER_TIMEOUT_S)))
             if IMAGE_NODE_RANK in (img, txt):
                 groups[(img, txt)] = g
     return groups
@@ -192,80 +190,31 @@ def _warmup_pairs(groups):
             torch.distributed.barrier()
 
 
-def send_worker(dest_rank: int, group):
-    torch.cuda.set_device(0)
-    while True:
-        image_id, result, done = _send_jobs[dest_rank].get()
-        try:
-            with pending_lock:
-                tensor = pending.pop(image_id, None)
-            if tensor is None:
-                logger.error("Send requested for unknown image_id=%s", image_id)
-                result["error"] = f"no pending tensor for image_id={image_id}"
-            else:
-                torch.distributed.send(tensor=tensor, dst=dest_rank, group=group)
-                logger.debug("Sent tensor image_id=%s -> rank %s", image_id, dest_rank)
-        except Exception as e:
-            logger.exception(
-                "Send failed for image_id=%s -> rank %s", image_id, dest_rank
-            )
-            result["error"] = str(e)
-        finally:
-            done.set()
-
-
 def nccl_send_worker():
-    torch.cuda.set_device(
-        0
-    )  # cuda:0 == this node's GPU (CUDA_VISIBLE_DEVICES is pinned)
-    torch.distributed.init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
-        rank=IMAGE_NODE_RANK,
-        world_size=WORLD_SIZE,
-    )  # NB: no device_id -- see _warmup_pairs (eager ncclCommSplit mis-builds the
-    # crossed subgroups -> 'send to self'); per-pair comms are warmed up serially.
-    torch.distributed.barrier()
-    groups = _build_pair_groups()
-    _warmup_pairs(groups)
-    for dest_rank in TEXT_RANKS:
-        _send_jobs[dest_rank] = queue.Queue()
-        _pair_group[dest_rank] = groups[(IMAGE_NODE_RANK, dest_rank)]
-        threading.Thread(
-            target=send_worker, args=(dest_rank, _pair_group[dest_rank]), daemon=True
-        ).start()
-    logger.info(
-        "Image node NCCL ready: rank=%s world=%s peers=%s",
-        IMAGE_NODE_RANK,
-        WORLD_SIZE,
-        len(TEXT_RANKS),
-    )
-    _nccl_ready.set()
-
-
-@app.route("/initiate_tensor_transfer_image_node", methods=["POST"])
-def initiate_send():
-    data = request.get_json()
-    image_id = normalize_image_id(data.get("image_id", ""))
-    dest_rank = data.get("dest_rank", 0)
-    result, done = {}, threading.Event()
-    q = _send_jobs.get(dest_rank)
-    if q is None:
-        return (
-            jsonify(
-                {
-                    "image_id": image_id,
-                    "error": f"no send worker for dest_rank={dest_rank}",
-                }
-            ),
-            500,
+    global _transfer_service
+    try:
+        torch.cuda.set_device(0)
+        torch.distributed.init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+            rank=IMAGE_NODE_RANK, world_size=WORLD_SIZE,
+            timeout=timedelta(seconds=float(cfg.NCCL_INIT_TIMEOUT_S)),
         )
-    q.put((image_id, result, done))
-    if not done.wait(timeout=SEND_TIMEOUT_S):
-        return jsonify({"image_id": image_id, "error": "send timed out"}), 504
-    if "error" in result:
-        return jsonify({"image_id": image_id, "error": result["error"]}), 500
-    return jsonify({"image_id": image_id}), 200
+        torch.distributed.barrier()
+        groups = _build_pair_groups()
+        _warmup_pairs(groups)
+        transport = TorchTransport("cuda:0", {peer: groups[(IMAGE_NODE_RANK, peer)] for peer in TEXT_RANKS})
+        _transfer_service = TransferService(
+            "sender", IMAGE_NODE_RANK, TEXT_RANKS, FEATURES, transport,
+            timeout_s=cfg.TENSOR_TRANSFER_TIMEOUT_S, queue_size=cfg.TRANSFER_QUEUE_SIZE,
+            history_s=float(cfg.MODSERVE_REQUEST_TIMEOUT_S) + 60,
+            history_limit=cfg.TRANSFER_HISTORY_LIMIT,
+        )
+        _transfer_service.install(app)
+        _nccl_ready.set()
+    except Exception:
+        logger.exception("NCCL sender initialization failed")
+        os._exit(1)
 
 
 @app.before_request
@@ -277,13 +226,21 @@ def before_request():
 def process_request():
     data = request.get_json()
     image_id = data.get("image_id", None)
+    try:
+        _transfer_service.health.check()
+        transfer_id = transfer_key(data.get("transfer_id"))
+        FEATURES.begin(transfer_id, data.get("request_id"), "encoding")
+    except ProtocolError as error:
+        return jsonify(error=str(error)), error.status
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     try:
-        image = Image.open(f"{IMG_DIR}/{image_id}").convert("RGB")
         with DATA_LOCK:
+            FEATURES.check_encoding(transfer_id, data.get("request_id"))
             start_time = time.perf_counter()
             waiting_time = round((time.perf_counter() - g.request_start_time) * 1000, 4)
+            with Image.open(f"{IMG_DIR}/{image_id}") as image_file:
+                image = image_file.convert("RGB")
             if IS_LLAMA:
                 inputs = processor(images=[image], return_tensors="pt").to(model.device)
             elif IS_INTERNVL:
@@ -313,16 +270,24 @@ def process_request():
                     outputs = outputs.reshape(outputs.shape[0], h, w, -1)
                     outputs = pixel_shuffle(outputs)
                     outputs = mlp(outputs)
-            with pending_lock:
-                pending[normalize_image_id(image_id)] = outputs.contiguous()
+            outputs = outputs.contiguous()
             end.record()
+            # Publish only after device work completes; cancellation cannot free
+            # an encoding reservation while this stream still uses its buffers.
+            torch.cuda.synchronize()
+            FEATURES.publish(transfer_id, outputs)
     except Exception as e:
         logger.exception("Failed to encode image_id=%s", image_id)
+        try:
+            torch.cuda.synchronize()
+            FEATURES.finish_device_use(transfer_id)
+        except Exception:
+            _transfer_service.health.fail("encoder CUDA failure; restart required")
         return (
             jsonify(
                 {"error": str(e), "image_id": image_id, "req_id": data.get("req_id", 0)}
             ),
-            500,
+            e.status if isinstance(e, ProtocolError) else 500,
         )
 
     torch.cuda.synchronize()
@@ -336,6 +301,11 @@ def process_request():
         json.dumps(
             {
                 "host": HOSTNAME,
+                "protocol_version": 2,
+                "transfer_id": transfer_id,
+                "request_id": data["request_id"],
+                "dtype": str(outputs.dtype).split(".")[-1],
+                "feature_bytes": outputs.numel() * outputs.element_size(),
                 "num_image_tokens": int(np.prod(list(outputs.shape[:-1]))),
                 "req_id": data.get("req_id", 0),
                 "image_id": image_id,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import shutil
 import signal
@@ -16,7 +17,7 @@ from lmm_serving import config as cfg
 from . import env
 from . import topology as topo
 
-RECV_PORT = "5051"
+RECV_PORT = str(cfg.TENSOR_TRANSFER_RECV_BASE_PORT)
 READY_TIMEOUT_S = 1800
 CLUSTER_MANAGER_TIMEOUT_S = 120
 
@@ -148,6 +149,7 @@ def _modserve_nodes(t: topo.Topology, run_id: str) -> list[Node]:
                     "CUDA_VISIBLE_DEVICES": ",".join(str(r) for r in text.local_ranks),
                     "TRANSFER_RANKS": f"{recv_rank}:0",
                     "TENSOR_TRANSFER_PORT": recv_port,
+                    "IMAGE_SOURCE_URLS": json.dumps({n.rank: n.address for n in t.image_nodes}),
                 },
                 log_file=logs / f"transfer-recv-{text.host}-{text.port}.log",
             )

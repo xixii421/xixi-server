@@ -55,6 +55,7 @@ def serve(
     err_log,
     image_content: Callable[[dict], list],
     priority_enabled: bool = False,
+    admission=None,
 ):
     base_url = f"http://localhost:{vllm_port(port)}/v1"
     # Huge multi-image prefills are slow, so allow a long per-request timeout and a
@@ -64,14 +65,20 @@ def serve(
     # and a large retry loop would just stall the whole run hammering a dead port.
     client = OpenAI(api_key="EMPTY", base_url=base_url, timeout=600.0, max_retries=4)
     app = Flask(__name__)
+    if admission is not None:
+        admission.install(app)
 
-    def _generate(inputs, output_len, ignore_eos, kind, priority):
+    def _generate(inputs, output_len, ignore_eos, kind, priority, timeout_s=None):
         start = time.perf_counter()
         extra_body = {"ignore_eos": ignore_eos}
         if priority_enabled:
             extra_body["priority"] = priority
         try:
-            completion = client.chat.completions.create(
+            # A multimodal request consumes transfer IDs. SDK retries must not
+            # replay it after an ambiguous backend timeout.
+            active_client = (client.with_options(timeout=timeout_s, max_retries=0)
+                             if timeout_s is not None else client)
+            completion = active_client.chat.completions.create(
                 messages=inputs,
                 model=model_id,
                 max_tokens=output_len,
@@ -114,13 +121,36 @@ def serve(
                 "Image request: images=%d output_len=%d", len(image_blocks), output_len
             )
 
-        vllm_req_id, status_code, text, latency_ms = _generate(
-            [{"role": "user", "content": content}],
-            output_len,
-            ignore_eos,
-            kind,
-            priority,
-        )
+        request_key = data.get("request_id") if image_blocks and admission is not None else None
+        timeout_s = None
+        if request_key is not None:
+            from .features import feature_bytes
+            from .resources import time_left, ProtocolError
+            import math
+            shapes = data["image_id_shapes"]
+            dtypes = data.get("transfer_dtypes", ["bfloat16"] * len(shapes))
+            total_bytes = sum(feature_bytes(shape, dtype) for shape, dtype in zip(shapes, dtypes))
+            total_tokens = sum(math.prod(shape[:-1]) for shape in shapes)
+            reserved_deadline = admission.begin(request_key, total_tokens, total_bytes)
+            try:
+                timeout_s = time_left(reserved_deadline)
+            except ProtocolError:
+                admission.complete(request_key)  # No engine call has started.
+                raise
+        elif image_blocks and admission is not None:
+            from .resources import ProtocolError
+            raise ProtocolError("multimodal request requires an admission reservation", 409)
+        try:
+            vllm_req_id, status_code, text, latency_ms = _generate(
+                [{"role": "user", "content": content}], output_len, ignore_eos,
+                kind, priority, timeout_s,
+            )
+        except BaseException:
+            if request_key is not None:
+                admission.complete(request_key, uncertain=True)
+            raise
+        if request_key is not None:
+            admission.complete(request_key, uncertain=status_code >= 500 or status_code == 408)
 
         response = requests.Response()
         response.status_code = status_code

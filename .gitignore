@@ -459,15 +459,13 @@ env/
 # Patched vLLM backend clone (built by llm-backend/build_vllm.sh)
 llm-backend/vllm/
 
-# Run artifacts. NOTE: metrics/ is ignored so newly-generated run directories
-# stay out of git; files already committed under metrics/ remain tracked (git
-# does not untrack committed files just because their path is ignored).
+# Generated experiment/demo results. Historical upstream CSV outputs were removed.
 logs/
 metrics/
+online_serving/results/
 
-# Datasets / model weights (large, downloaded). NOTE: the repo intentionally
-# tracks sample metrics/, profiles/*/profile.json and traces/experiment_traces/
-# reference outputs, so those are deliberately NOT ignored here.
+# Large downloads. Small replay traces and upstream reference profiles remain
+# tracked; regenerate profiles on your own hardware before enabling autoscaling.
 hf_cache/
 sharegpt_images/
 *.csv.gz

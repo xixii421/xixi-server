@@ -50,6 +50,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="launcher", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # Independent CPU-only path; import the heavy learning dependencies only
+    # when selected. Production topology and NCCL startup retain their semantics.
+    from lmm_serving.learning.cli import add_arguments, run as run_learning
+
+    p_learn = sub.add_parser("learn", help="run CPU/Gloo single_gpu_mock mode")
+    add_arguments(p_learn)
+    p_learn.set_defaults(func=lambda args, _: run_learning(args))
+
     p_run = sub.add_parser("run", help="launch an experiment")
     p_run.add_argument("setup", choices=SETUPS)
     p_run.add_argument("scales", help="comma list, e.g. 8.0,4.0")

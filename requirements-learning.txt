@@ -1,0 +1,7 @@
+# Linux/WSL CPU-only learning environment; no vLLM or model downloads.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+Flask==3.1.0
+Pillow==11.1.0
+requests==2.32.3
+PyYAML==6.0.3
