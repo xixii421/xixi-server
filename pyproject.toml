@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lmm-serving"
 version = "0.1.0"
-description = "Serving infrastructure and trace-replay benchmarks for large multimodal models (LMMs)"
+description = "ModServe paper reproduction and improvements for multimodal inference serving"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -26,8 +26,9 @@ classifiers = [
 dynamic = ["dependencies"]
 
 [project.urls]
-Homepage = "https://github.com/Azure/ModServe"
-Repository = "https://github.com/Azure/ModServe"
+Homepage = "https://github.com/xixii421/xixi-server"
+Repository = "https://github.com/xixii421/xixi-server"
+Upstream = "https://github.com/Azure/ModServe"
 Paper = "https://dl.acm.org/doi/10.1145/3698038.3698540"
 
 [tool.setuptools.dynamic]
