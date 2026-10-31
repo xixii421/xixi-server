@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 
 from lmm_serving.vpd_local import VModelSpec
-from lmm_serving.vpd_options import add_runtime_arguments
+from lmm_serving.vpd_options import add_runtime_arguments,placement_kwargs
 from lmm_serving.vpd_transport import TensorChannel
 
 
@@ -45,39 +45,43 @@ def probe_worker(rank,spec,store,events,sizes,repeats,warmups,timeout):
         spec=spec.for_rank(rank)
         if spec.device.startswith("cuda:"):
             torch.cuda.set_device(spec.device)
-        dist.init_process_group("gloo",init_method="file://"+store,rank=rank,world_size=3,
+        dist.init_process_group("gloo",init_method="file://"+store,rank=rank,world_size=spec.worker_count,
                                 timeout=timedelta(seconds=timeout))
         channel=TensorChannel.start(spec,timeout)
         results=[]
         sequence=0
+        # 验证相邻阶段的所有候选连接，包括未被一次轮询请求选到的副本组合。
+        edges=[(name,source,destination) for stage,name in ((0,"V->P"),(1,"P->D"))
+               for source in spec.ranks_for(stage) for destination in spec.ranks_for(stage+1)]
         for dtype in (torch.float32,torch.bfloat16):
             element_bytes=torch.empty((),dtype=dtype).element_size()
             for size in sizes:
-                for iteration in range(warmups+repeats):
-                    sequence+=1
-                    expected=((torch.arange(size//element_bytes,device=spec.device)%97)+sequence%13).to(dtype)
-                    if spec.device.startswith("cuda:"):
-                        torch.cuda.synchronize(spec.device)
-                    dist.barrier()
-                    if rank in (1,2):
-                        received=channel.stage(channel.receive(expected.shape,dtype,rank-1))
-                        if not torch.equal(received,expected):
-                            raise ValueError(f"rank {rank}: payload corruption at sequence {sequence}")
-                        dist.send(torch.tensor([sequence],dtype=torch.int64),dst=rank-1)
-                    if rank in (0,1):
-                        started=time.perf_counter()
-                        payload=channel.prepare(expected if rank==0 else received)
-                        channel.send(payload,rank+1)
-                        ack=torch.zeros(1,dtype=torch.int64)
-                        dist.recv(ack,src=rank+1)
-                        elapsed_ms=(time.perf_counter()-started)*1000
-                        if ack.item()!=sequence:
-                            raise ValueError("probe ACK mismatch")
-                        if iteration>=warmups:
-                            results.append({"edge":"V->P" if rank==0 else "P->D",
-                                            "dtype":str(dtype),"bytes":expected.numel()*element_bytes,
-                                            "iteration":iteration-warmups,"handoff_ms":elapsed_ms})
-                    dist.barrier()  # Keep successive edges/iterations from racing.
+                for edge,source,destination in edges:
+                    for iteration in range(warmups+repeats):
+                        sequence+=1
+                        expected=((torch.arange(size//element_bytes,device=spec.device)%97)+sequence%13).to(dtype)
+                        if spec.device.startswith("cuda:"):
+                            torch.cuda.synchronize(spec.device)
+                        dist.barrier()
+                        if rank==destination:
+                            received=channel.stage(channel.receive(expected.shape,dtype,source))
+                            if not torch.equal(received,expected):
+                                raise ValueError(f"rank {rank}: payload corruption at sequence {sequence}")
+                            dist.send(torch.tensor([sequence],dtype=torch.int64),dst=source)
+                        elif rank==source:
+                            started=time.perf_counter()
+                            payload=channel.prepare(expected)
+                            channel.send(payload,destination)
+                            ack=torch.zeros(1,dtype=torch.int64)
+                            dist.recv(ack,src=destination)
+                            elapsed_ms=(time.perf_counter()-started)*1000
+                            if ack.item()!=sequence:
+                                raise ValueError("probe ACK mismatch")
+                            if iteration>=warmups:
+                                results.append({"edge":edge,"source_rank":source,"destination_rank":destination,
+                                                "dtype":str(dtype),"bytes":expected.numel()*element_bytes,
+                                                "iteration":iteration-warmups,"handoff_ms":elapsed_ms})
+                        dist.barrier()  # 其余副本也参与屏障，防止不同连接间操作交错。
         result.update(passed=True,samples=results)
     except BaseException:
         result["error"]=traceback.format_exc()
@@ -112,13 +116,13 @@ def run_probe(spec,*,sizes,repeats,warmups,timeout):
     results=[]
     with tempfile.TemporaryDirectory(prefix="vpd-probe-") as directory:
         try:
-            for rank in range(3):
+            for rank in range(spec.worker_count):
                 process=context.Process(target=probe_worker,args=(rank,spec,str(Path(directory)/"store"),
                     events,sizes,repeats,warmups,timeout))
                 processes.append(process)
                 process.start()
             deadline=time.monotonic()+timeout
-            while len(results)<3:
+            while len(results)<spec.worker_count:
                 if time.monotonic()>=deadline:
                     raise TimeoutError("transport probe deadline exceeded")
                 if any(p.exitcode not in (None,0) for p in processes):
@@ -144,12 +148,13 @@ def run_probe(spec,*,sizes,repeats,warmups,timeout):
     samples=[sample for result in results for sample in result["samples"]]
     groups={}
     for sample in samples:
-        key=(sample["edge"],sample["dtype"],sample["bytes"])
+        key=(sample["edge"],sample["source_rank"],sample["destination_rank"],sample["dtype"],sample["bytes"])
         groups.setdefault(key,[]).append(sample["handoff_ms"])
-    summary=[{"edge":edge,"dtype":dtype,"bytes":size,"samples":len(values),
+    summary=[{"edge":edge,"source_rank":source,"destination_rank":destination,
+              "dtype":dtype,"bytes":size,"samples":len(values),
               "handoff_p50_ms":statistics.median(values),
               "handoff_p95_ms":sorted(values)[max(0,math.ceil(.95*len(values))-1)]}
-             for (edge,dtype,size),values in groups.items()]
+             for (edge,source,destination,dtype,size),values in groups.items()]
     return {"passed":True,"samples":samples,"summary":summary,"worker_exitcodes":exitcodes,
             "worker_results":[{"rank":r["rank"],"passed":r["passed"],"exitcode":exitcodes[r["rank"]]}
                               for r in sorted(results,key=lambda result:result["rank"])]}
@@ -169,9 +174,9 @@ def main():
     if (any(n<=0 or n>65536 for n in args.sizes_kib) or args.repeats<1 or args.warmups<0
             or not math.isfinite(args.timeout) or args.timeout<=0):
         parser.error("invalid probe size, count or timeout")
-    spec=VModelSpec(device=args.device,transport=args.transport,
-                   stage_devices=tuple(args.stage_devices) if args.stage_devices else None)
+    spec=VModelSpec(device=args.device,transport=args.transport,**placement_kwargs(args))
     report={"passed":False,"transport":spec.transport,"stage_devices":list(spec.devices),
+            "stage_pools":[list(pool) for pool in spec.pools],"worker_count":spec.worker_count,
             "scope":"validated single-host handoff: sender staging + payload + receiver staging/equality + Gloo ACK; not raw link bandwidth"}
     try:
         spec.check_hardware()

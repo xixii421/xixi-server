@@ -1,0 +1,157 @@
+{
+  "local_validation_passed": true,
+  "unit_and_integration_tests_executed": 89,
+  "launcher_script_checks": 41,
+  "gpu_acceptance_tests_skipped": 3,
+  "real_multi_gpu_acceptance_completed": false,
+  "suites": [
+    {
+      "name": "vpd_pools",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 16,
+      "skipped_count": 1,
+      "executed_count": 15,
+      "count_kind": "tests",
+      "elapsed_s": 21.604224280000153,
+      "passed": true
+    },
+    {
+      "name": "vpd_transport",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 2,
+      "executed_count": 12,
+      "count_kind": "tests",
+      "elapsed_s": 6.590217638000013,
+      "passed": true
+    },
+    {
+      "name": "vpd_tools",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 3,
+      "skipped_count": 0,
+      "executed_count": 3,
+      "count_kind": "tests",
+      "elapsed_s": 5.741607349999867,
+      "passed": true
+    },
+    {
+      "name": "vpd",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 18,
+      "skipped_count": 0,
+      "executed_count": 18,
+      "count_kind": "tests",
+      "elapsed_s": 21.909054150999964,
+      "passed": true
+    },
+    {
+      "name": "vision_cache",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 8,
+      "skipped_count": 0,
+      "executed_count": 8,
+      "count_kind": "tests",
+      "elapsed_s": 8.892478368999946,
+      "passed": true
+    },
+    {
+      "name": "pd_local",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 0,
+      "executed_count": 14,
+      "count_kind": "tests",
+      "elapsed_s": 20.416723117999936,
+      "passed": true
+    },
+    {
+      "name": "pd_service",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 5,
+      "skipped_count": 0,
+      "executed_count": 5,
+      "count_kind": "tests",
+      "elapsed_s": 5.184104510999987,
+      "passed": true
+    },
+    {
+      "name": "stream_benchmark",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 0,
+      "executed_count": 14,
+      "count_kind": "tests",
+      "elapsed_s": 0.7163083269999788,
+      "passed": true
+    },
+    {
+      "name": "launcher",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 41,
+      "skipped_count": 0,
+      "executed_count": 41,
+      "count_kind": "script_checks",
+      "elapsed_s": 0.2651090130000284,
+      "passed": true
+    }
+  ],
+  "layouts_tested_on_cpu": [
+    "1V1P2D",
+    "2V1P1D",
+    "1V2P1D",
+    "1V2P2D"
+  ],
+  "probe_all_edges_tested": "2V2P1D, all 6 V->P/P->D candidate edges, float32/bfloat16",
+  "pretrained_single_gpu_loopback": {
+    "passed": true,
+    "model": "SmolVLM-256M-Instruct",
+    "stage_pools": [
+      [
+        "cuda:0"
+      ],
+      [
+        "cuda:0"
+      ],
+      [
+        "cuda:0",
+        "cuda:0"
+      ]
+    ],
+    "invariants": {
+      "all_cases_match_unsplit": true,
+      "all_independent_processes": true,
+      "text_bypasses_vision": true,
+      "requested_placement_reported": true,
+      "requested_transport_reported": true,
+      "http_nonstream_matches": true,
+      "http_stream_ok": true,
+      "http_stream_matches": true,
+      "all_vision_workers_used": true,
+      "all_prefill_workers_used": true,
+      "all_decode_workers_used": true,
+      "different_images_different_features": true,
+      "swapping_images_changes_ordered_features": true
+    }
+  },
+  "benchmark_smoke": {
+    "passed": true,
+    "measured_requests": 18,
+    "decoder_ranks_used": [
+      2,
+      3
+    ],
+    "scope": "one physical GPU, script correctness only"
+  },
+  "expected_four_gpu_preflight_rejection_passed": true,
+  "scope": "Serialized requests, stage-local round robin. No parallel throughput or cross-GPU P2P result claimed."
+}

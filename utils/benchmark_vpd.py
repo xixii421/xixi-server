@@ -24,7 +24,7 @@ from lmm_serving.monolithic_local import MonolithicVLM
 from lmm_serving.vpd_local import LocalVPD,VModelSpec
 from lmm_serving.vpd_service import VPDHTTPServer
 from lmm_serving.stream_benchmark import measure
-from lmm_serving.vpd_options import add_runtime_arguments
+from lmm_serving.vpd_options import add_runtime_arguments,placement_kwargs
 
 MODES=("monolithic","vpd_uncached","vpd_cached")
 SCENARIOS=("hot_reuse","cold_unique","mixed_reuse")
@@ -101,8 +101,7 @@ def main():
     args=parser.parse_args()
     if args.requests<1 or args.rounds<1 or not 1<=args.new_tokens<=32:
         parser.error("invalid sample or generation count")
-    placement=VModelSpec(device=args.device,transport=args.transport,
-                        stage_devices=tuple(args.stage_devices) if args.stage_devices else None)
+    placement=VModelSpec(device=args.device,transport=args.transport,**placement_kwargs(args))
     placement.check_hardware()
     args.output_dir.mkdir(parents=True,exist_ok=False)
     all_records=[]
@@ -118,6 +117,7 @@ def main():
                                device=placement.devices[0] if mode=="monolithic" else args.device,dtype="bfloat16",
                                transport="gloo" if mode=="monolithic" else args.transport,
                                stage_devices=None if mode=="monolithic" else placement.stage_devices,
+                               stage_pools=None if mode=="monolithic" else placement.stage_pools,
                                verify_payload=not args.no_handoff_checksum,
                                vision_cache_bytes=16*1024*1024 if mode=="vpd_cached" else 0)
                 runtime=(MonolithicVLM(spec) if mode=="monolithic" else
@@ -195,6 +195,7 @@ def main():
             "comparisons":comparisons,"blocks":blocks,"warmups":warmups,
             "configuration":{"model":str(args.model.resolve()),"device":args.device,
                 "vpd_stage_devices":list(placement.devices),"vpd_transport":args.transport,
+                "vpd_stage_pools":[list(pool) for pool in placement.pools],"vpd_worker_count":placement.worker_count,
                 "handoff_checksum":not args.no_handoff_checksum,
                 "resource_comparison":"monolithic uses one GPU; VPD uses the listed stage devices; no equal-GPU-budget scaling claim",
                 "dtype":"bfloat16","rounds":args.rounds,"requests_per_scenario_per_round":args.requests,

@@ -14,7 +14,7 @@ import torch
 from lmm_serving.vpd_local import LocalVPD,VModelSpec,reference_generate
 from lmm_serving.vpd_service import VPDHTTPServer
 from lmm_serving.stream_benchmark import measure,open_endpoint
-from lmm_serving.vpd_options import add_runtime_arguments
+from lmm_serving.vpd_options import add_runtime_arguments,placement_kwargs
 
 
 def make_messages(colors=()):
@@ -41,7 +41,7 @@ def main():
     args.output.parent.mkdir(parents=True,exist_ok=True)
     spec=VModelSpec(model_path=str(args.model.resolve()) if args.model else None,
                    device=args.device,dtype="bfloat16",transport=args.transport,
-                   stage_devices=tuple(args.stage_devices) if args.stage_devices else None,
+                   **placement_kwargs(args),
                    verify_payload=not args.no_handoff_checksum,
                    vision_cache_bytes=args.vision_cache_mib*1024*1024)
     try:
@@ -54,6 +54,9 @@ def main():
         return 2
     reference_spec=replace(spec,device=spec.devices[0])
     colors=[[],["red"],["blue"],["red","blue"],["blue","red"],["red","red"]]
+    while (sum(bool(case) for case in colors)<len(spec.pools[0]) or
+           len(colors)<max(len(spec.pools[1]),len(spec.pools[2]))):
+        colors.append(["red","blue"])
     references=[]
     for case in colors:
         references.append(reference_generate(reference_spec,make_messages(case),args.new_tokens))
@@ -86,7 +89,7 @@ def main():
                        if runtime.processor else "".join(f"{t} " for t in references[3]))
     invariants={
         "all_cases_match_unsplit":all(case["matched"] for case in cases),
-        "three_independent_processes":all(len(set(c["result"]["worker_pids"]))==3 for c in cases),
+        "all_independent_processes":all(len(set(c["result"]["worker_pids"]))==spec.worker_count for c in cases),
         "text_bypasses_vision":cases[0]["result"]["vision_bypassed"],
         "requested_placement_reported":all(c["result"]["stage_devices"]==list(spec.devices) for c in cases),
         "requested_transport_reported":all(c["result"]["transport"]==spec.transport for c in cases),
@@ -94,6 +97,9 @@ def main():
         "http_stream_ok":stream["status"]=="ok",
         "http_stream_matches":stream["content"]==expected_text,
     }
+    for stage,name in enumerate(("vision","prefill","decode")):
+        used={case["result"]["route"][name] for case in cases}
+        invariants[f"all_{name}_workers_used"]=set(spec.ranks_for(stage))<=used
     checksum_checks=("different_images_different_features","swapping_images_changes_ordered_features")
     if spec.verify_payload:
         invariants[checksum_checks[0]]=cases[1]["result"]["prefill_feature_digest"]!=cases[2]["result"]["prefill_feature_digest"]

@@ -38,6 +38,7 @@ class VModelSpec(ModelSpec):
     max_feature_bytes: int = 4*1024*1024
     vision_cache_bytes: int = 0
     stage_devices: tuple[str, str, str] | None = None
+    stage_pools: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None = None
     transport: str = "gloo"
     verify_payload: bool = True
 
@@ -52,20 +53,47 @@ class VModelSpec(ModelSpec):
             raise ValueError("transport must be gloo or nccl")
         if type(self.verify_payload) is not bool:
             raise ValueError("verify_payload must be boolean")
+        if self.stage_pools is not None:
+            if self.stage_devices is not None:
+                raise ValueError("use stage_pools or stage_devices, not both")
+            if (not isinstance(self.stage_pools, tuple) or len(self.stage_pools) != 3 or
+                    any(not isinstance(pool, tuple) or not pool for pool in self.stage_pools)):
+                raise ValueError("stage_pools must contain nonempty V/P/D device tuples")
+            for pool in self.stage_pools:
+                for device in pool:
+                    validate_device(device)
         if self.stage_devices is not None:
             if not isinstance(self.stage_devices, tuple) or len(self.stage_devices) != 3:
                 raise ValueError("stage_devices must be a tuple of V/P/D devices")
             for device in self.stage_devices:
                 validate_device(device)
         if self.transport == "nccl":
-            if self.stage_devices is None:
+            if self.stage_devices is None and self.stage_pools is None:
                 object.__setattr__(self, "stage_devices", ("cuda:0", "cuda:1", "cuda:2"))
-            if len(set(self.stage_devices)) != 3 or any(not d.startswith("cuda:") for d in self.stage_devices):
-                raise ValueError("NCCL VPD requires three distinct CUDA devices, one per process")
+            if len(set(self.devices)) != self.worker_count or any(not d.startswith("cuda:") for d in self.devices):
+                raise ValueError("NCCL requires distinct CUDA devices, one per worker")
+
+    @property
+    def pools(self):
+        if self.stage_pools is not None:
+            return self.stage_pools
+        return tuple((device,) for device in (self.stage_devices or (self.device,)*3))
 
     @property
     def devices(self):
-        return self.stage_devices or (self.device,)*3
+        return tuple(device for pool in self.pools for device in pool)
+
+    @property
+    def worker_count(self):
+        return len(self.devices)
+
+    @property
+    def worker_stages(self):
+        # global rank 按 V 池、P 池、D 池的顺序连续分配，不再把 rank 当作阶段。
+        return tuple(stage for stage,pool in enumerate(self.pools) for _ in pool)
+
+    def ranks_for(self,stage):
+        return tuple(rank for rank,role in enumerate(self.worker_stages) if role == stage)
 
     def for_rank(self, rank):
         return replace(self, device=self.devices[rank])
@@ -362,6 +390,7 @@ def feature_header(spec, request, tensor, channel):
     """V -> P 的元数据：绑定请求、文本和有序图片，描述特征形状及可选摘要。"""
     return {"version": 1,"request_id":request["request_id"],"sequence":request["sequence"],
             "signature":spec.signature(),"context_digest":request["context_digest"],
+            "route":request.get("route"),
             "shape":list(tensor.shape),"dtype":spec.dtype,"digest":channel.digest(tensor),
             "verify_payload":channel.verify_payload,
             "image_digests":request["image_digests"],
@@ -370,11 +399,13 @@ def feature_header(spec, request, tensor, channel):
 
 def receive_features(spec,request,channel):
     """P 接收视觉特征：先验头和容量，再收张量，确认可用后向 V 发 ACK。"""
-    header = receive_header(0)
+    source = request.get("route",{}).get("vision",0)
+    header = receive_header(source)
     # 形状取自本地已知的图片数、每图 token 数和语言隐藏维度，不由对端随意决定。
     shape = [request["image_count"],spec.image_seq_len(),spec.config()["hidden_size"]]
     expected = {"version":1,"request_id":request["request_id"],"sequence":request["sequence"],
                 "signature":spec.signature(),"context_digest":request["context_digest"],
+                "route":request.get("route"),
                 "shape":shape,"dtype":spec.dtype,"image_digests":request["image_digests"],
                 "verify_payload":channel.verify_payload,
                 "prompt_digest":hashlib.sha256(json.dumps(request["tokens"]).encode()).hexdigest()}
@@ -383,16 +414,16 @@ def receive_features(spec,request,channel):
     if np.prod(shape)*(4 if spec.dtype == "float32" else 2) > spec.max_feature_bytes:
         raise ValueError("visual feature byte budget exceeded")
     # channel 决定接收在 CPU 还是当前 GPU；stage 再保证张量位于 P 的计算设备。
-    tensor = channel.receive(shape,getattr(torch,spec.dtype),0)
+    tensor = channel.receive(shape,getattr(torch,spec.dtype),source)
     channel.validate_digest(tensor,header.get("digest"))
     tensor = channel.stage(tensor)
     # 只有通过检查且搬运完成才能确认。ACK 携带本次通道序号，走默认 Gloo 组。
-    dist.send(torch.tensor([request["sequence"]],dtype=torch.int64),dst=0)
+    dist.send(torch.tensor([request["sequence"]],dtype=torch.int64),dst=source)
     return tensor,header["digest"]
 
 
 def vpd_worker(rank,spec,store,control,events,timeout):
-    """一个 worker 对应一个阶段：rank 0=V，1=P，2=D。
+    """一个 worker 对应阶段池内的一个副本，rank 由配置布局决定。
 
     注意三类通信的区别：
     1. control/events：主进程与 worker 之间的 multiprocessing.Queue。
@@ -403,25 +434,27 @@ def vpd_worker(rank,spec,store,control,events,timeout):
     try:
         # rank 是进程编号，不等于 GPU 编号；实际映射由 stage_devices 决定。
         spec = spec.for_rank(rank)
+        stage = spec.worker_stages[rank]
         if spec.device.startswith("cuda:"):
             # 在加载 GPU 权重、创建 NCCL 组之前绑定本进程的当前设备。
             torch.cuda.set_device(spec.device)
-        model = load_stage(spec,rank)
-        processor = load_processor(spec) if rank == 0 else None
-        cache_store=VisionFeatureCache(spec.vision_cache_bytes) if rank==0 else None
+        model = load_stage(spec,stage)
+        processor = load_processor(spec) if stage == 0 else None
+        cache_store=VisionFeatureCache(spec.vision_cache_bytes) if stage==0 else None
         # FileStore 用本机共享文件做启动 rendezvous，不用于传输模型数据。
-        # 三个进程先建立默认 Gloo 组，再以相同顺序建立可选 NCCL 数据组。
-        dist.init_process_group("gloo",init_method="file://"+store,rank=rank,world_size=3,
+        # 所有副本都加入组；只有为本次请求选中的 V/P/D 参与载荷交接。
+        dist.init_process_group("gloo",init_method="file://"+store,rank=rank,world_size=spec.worker_count,
                                 timeout=timedelta(seconds=timeout))
         channel = TensorChannel.start(spec,timeout)
-        # ready 表示权重加载和通信预热均已成功，主进程收到三个 ready 后才接请求。
+        # ready 表示权重加载和通信预热均已成功，主进程收齐所有副本后才接请求。
         events.put({"type":"ready","rank":rank,"device":spec.device,
+                    "stage":("vision","prefill","decode")[stage],
                     "transport":spec.transport,"verify_payload":spec.verify_payload})
         while True:
             request = control.get()
             if request is None:
                 break
-            if rank == 0:
+            if stage == 0:
                 # V：预处理图片/文本，运行真实视觉编码或复用 CPU 视觉缓存。
                 started = time.perf_counter()
                 inputs = tensor = None
@@ -447,10 +480,11 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                             "tokens":request["tokens"],"feature_digest":header["digest"]})
                 encoded = time.perf_counter()
                 # V -> P：头部(Gloo) -> 特征(channel) -> 接管确认(Gloo)。
-                send_header(header,1)
-                channel.send(tensor,1)
+                destination = request["route"]["prefill"]
+                send_header(header,destination)
+                channel.send(tensor,destination)
                 ack = torch.zeros(1,dtype=torch.int64)
-                dist.recv(ack,src=1)
+                dist.recv(ack,src=destination)
                 if ack.item() != request["sequence"]:
                     raise ValueError("visual acknowledgement mismatch")
                 events.put({"type":"vision_handoff","request_id":request["request_id"],
@@ -459,7 +493,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                             "feature_bytes":tensor.numel()*tensor.element_size(),
                             "vision_preprocess_ms":(prepared-started)*1000,**cache_stats})
                 del tensor,inputs  # 对端已确认接管，才释放本次视觉交接持有的引用。
-            elif rank == 1:
+            elif stage == 1:
                 # P：有图就等待 V 的特征；纯文本请求直接绕过视觉通信。
                 features,feature_digest = (receive_features(spec,request,channel) if request["image_count"] else (None,None))
                 started = time.perf_counter()
@@ -469,7 +503,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                 # Prefill 得到“prompt 的 KV”和“首个生成 Token”。先通知客户端首
                 # Token，再交接 KV，因此 KV 传输开销还应看首/第二 Token 间隔。
                 events.put({"type":"token","request_id":request["request_id"],"index":0,"token":first})
-                send_kv(channel,spec,request,result,first,ready_at,destination=2)
+                send_kv(channel,spec,request,result,first,ready_at,destination=request["route"]["decode"])
                 events.put({"type":"handoff","request_id":request["request_id"],
                             "prefill_ms":(ready_at-started)*1000,
                             "handoff_ms":(time.perf_counter()-ready_at)*1000,
@@ -477,7 +511,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                 del result,features  # send_kv 已等待 D 的 ACK，此时才能释放 P 侧缓存。
             else:
                 # D：用收到的 prompt KV 续算。首 Token 已有，不重算完整 prompt。
-                cache,header = receive_kv(channel,spec,request,source=1)
+                cache,header = receive_kv(channel,spec,request,source=request["route"]["prefill"])
                 output,times = [header["first_token"]],[header["first_token_ready_s"]]
                 for index in range(1,request["new_tokens"]):
                     # 每步仅输入上一个 Token；历史上下文由不断增长的 KV 提供。
@@ -496,7 +530,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
             del request
     except BaseException as error:
         # 一旦开始阶段间通信，异常可能让另一端停在 recv/send。
-        # 通知主进程统一关闭三个 worker，避免在状态不确定的通道上继续服务。
+        # 通知主进程统一关闭全部 worker，避免在状态不确定的通道上继续服务。
         events.put({"type":"error","rank":rank,"error":f"{type(error).__name__}: {error}"})
     finally:
         if dist.is_initialized():
@@ -511,29 +545,37 @@ def vpd_worker(rank,spec,store,control,events,timeout):
 class LocalVPD(LocalPD):
     def __init__(self,spec=VModelSpec(),**kwargs):
         super().__init__(spec,**kwargs)
-        self.controls.append(self.context.Queue())
+        self.controls.extend(self.context.Queue() for _ in range(spec.worker_count-len(self.controls)))
         self.processor = load_processor(spec)
         self.scope = spec.scope
         self.worker_info = []
+        self._stage_cursors = [0,0,0]
+
+    def _select_worker(self,stage):
+        pool = self.spec.ranks_for(stage)
+        rank = pool[self._stage_cursors[stage] % len(pool)]
+        self._stage_cursors[stage] += 1
+        return rank
 
     def __enter__(self):
-        # 主进程不加入三 rank 的通信组，只负责预检、启动与调度。
+        # 主进程不加入通信组，只负责预检、启动与调度。
         try:
             self.spec.check_hardware()
             self._directory = tempfile.TemporaryDirectory(prefix="modserve-vpd-")
             store = str(Path(self._directory.name)/"gloo-store")
-            for rank in range(3):
+            for rank in range(self.spec.worker_count):
                 process = self.context.Process(target=vpd_worker,args=(rank,self.spec,store,
                     self.controls[rank],self.events,max(self.startup_timeout_s,self.request_timeout_s)))
                 self.processes.append(process)
                 process.start()
             ready = set()
             deadline = time.monotonic()+self.startup_timeout_s
-            while len(ready)<3:
+            while len(ready)<self.spec.worker_count:
                 event = self._event(deadline)
                 if (event["type"] != "ready" or event.get("rank") in ready or
-                        event.get("rank") not in (0,1,2) or
+                        event.get("rank") not in range(self.spec.worker_count) or
                         event.get("device") != self.spec.devices[event["rank"]] or
+                        event.get("stage") != ("vision","prefill","decode")[self.spec.worker_stages[event["rank"]]] or
                         event.get("transport") != self.spec.transport or
                         event.get("verify_payload") is not self.spec.verify_payload):
                     raise RuntimeError("invalid VPD startup event")
@@ -557,10 +599,13 @@ class LocalVPD(LocalPD):
         # 当前只有一条串行交接通道。锁覆盖完整请求，保证头/载荷/ACK 的顺序；
         # 请求 UUID 和序号用于校验，不能替代真正的并发多路复用协议。
         with self._lock:
-            if self._closed or len(self.processes)!=3:
+            if self._closed or len(self.processes)!=self.spec.worker_count:
                 raise RuntimeError("VPD runtime is not active")
             self._sequence += 1
+            route = {"vision":self._select_worker(0) if images else None,
+                     "prefill":self._select_worker(1),"decode":self._select_worker(2)}
             request = {"request_id":uuid.uuid4().hex,"sequence":self._sequence,
+                       "route":route,
                        "new_tokens":new_tokens,"image_count":len(images),"image_digests":digests,
                        "context_digest":hashlib.sha256(json.dumps(digests).encode()).hexdigest()}
             started = time.perf_counter()
@@ -568,7 +613,7 @@ class LocalVPD(LocalPD):
             feature_digest = None
             if images:
                 # 先只唤醒 V，拿到处理器展开图像占位符后的完整 token 序列。
-                self.controls[0].put({**request,"messages":normalized,"images":images})
+                self.controls[route["vision"]].put({**request,"messages":normalized,"images":images})
                 try:
                     event = self._event(deadline)
                     if event.get("request_id")!=request["request_id"]:
@@ -589,8 +634,8 @@ class LocalVPD(LocalPD):
                 request["tokens"] = inputs["input_ids"][0].tolist()
                 self.spec.validate(request["tokens"],new_tokens)
             # P/D 现在都知道同一份 tokens 和图片上下文，才能核对交接元数据。
-            for control in self.controls[1:]:
-                control.put(request)
+            for rank in (route["prefill"],route["decode"]):
+                self.controls[rank].put(request)
             expected = ("vision_handoff","handoff","result") if images else ("handoff","result")
             # 主进程通过事件队列收 Token 和阶段完成消息；不亲自搬运特征/KV。
             received = self.collect(request,deadline,on_token,expected)
@@ -602,6 +647,7 @@ class LocalVPD(LocalPD):
             times = result["token_ready_times_s"]
             result.update(mode="idefics3_three_stage",device=self.spec.devices[0],transport=self.spec.transport,
                 stage_devices=list(self.spec.devices),control_transport="gloo",
+                stage_pools=[list(pool) for pool in self.spec.pools],route=route,
                 verify_payload=self.spec.verify_payload,worker_info=self.worker_info,
                 worker_pids=[p.pid for p in self.processes],image_count=len(images),
                 image_digests=digests,vision_bypassed=not images,

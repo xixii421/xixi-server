@@ -1,4 +1,4 @@
-"""Fail-closed three-GPU acceptance bundle; writes logs, hashes and JSON results."""
+"""Device-pool GPU acceptance bundle; writes logs, hashes and JSON results."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -12,6 +12,7 @@ import time
 import traceback
 
 from lmm_serving.vpd_local import VModelSpec
+from lmm_serving.vpd_options import add_placement_arguments,placement_kwargs
 from probe_vpd_transport import hardware_snapshot
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -64,7 +65,7 @@ def run_step(name,arguments,output_dir,env,timeout):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model",type=Path,required=True,help="existing local Idefics3/SmolVLM weights")
-    parser.add_argument("--stage-devices",nargs=3,default=["cuda:0","cuda:1","cuda:2"])
+    add_placement_arguments(parser)
     parser.add_argument("--output-dir",type=Path,required=True,help="new directory; no overwrite")
     parser.add_argument("--benchmark",action="store_true",help="also run paired Gloo/NCCL HTTP ablations")
     parser.add_argument("--requests",type=int,default=20)
@@ -75,13 +76,15 @@ def main():
     args.output_dir=args.output_dir.resolve()
     args.output_dir.mkdir(parents=True,exist_ok=False)
     report={"passed":False,"hardware_validated":False,"created_utc":datetime.now(timezone.utc).isoformat(),
-            "steps":[],"stage_devices":args.stage_devices,"is_performance_benchmark":args.benchmark,
-            "scope":"single-host three-GPU V/P/D acceptance; no multi-node/RDMA/overlap claim"}
+            "steps":[],"is_performance_benchmark":args.benchmark,
+            "scope":"single-host V/P/D device-pool acceptance; serialized requests; no multi-node/RDMA/overlap claim"}
     try:
-        spec=VModelSpec(model_path=str(args.model.resolve()),transport="nccl",stage_devices=tuple(args.stage_devices))
+        spec=VModelSpec(model_path=str(args.model.resolve()),transport="nccl",**placement_kwargs(args))
         spec.full_config()  # Reject unsupported model families before GPU work.
         spec.check_hardware()
         report["hardware_validated"]=True
+        report.update(stage_devices=list(spec.devices),stage_pools=[list(pool) for pool in spec.pools],
+                      worker_count=spec.worker_count)
         report["hardware"]=hardware_snapshot(spec.devices)
         manifest={"source_sha256":{str(p.relative_to(ROOT)):file_sha(p)
                                   for folder in ("src/lmm_serving","tests","utils")
@@ -92,10 +95,18 @@ def main():
                   "python":sys.version,
                   "pip_freeze":subprocess.run([sys.executable,"-m","pip","freeze"],capture_output=True,text=True).stdout.splitlines()}
         (args.output_dir/"source_manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
-        env={**os.environ,"PYTHONPATH":str(ROOT/"src"),"VPD_RUN_THREE_GPU_TESTS":"1",
-             "VPD_TEST_STAGE_DEVICES":",".join(args.stage_devices),"PYTHONUNBUFFERED":"1"}
-        placement=["--stage-devices",*args.stage_devices]
-        steps=[("three_gpu_tests",["tests/test_vpd_transport.py"],360)]
+        env={**os.environ,"PYTHONPATH":str(ROOT/"src"),"VPD_RUN_THREE_GPU_TESTS":"0",
+             "VPD_RUN_FOUR_GPU_TESTS":"0","PYTHONUNBUFFERED":"1"}
+        placement=[argument for flag,pool in zip(("--vision-devices","--prefill-devices","--decode-devices"),spec.pools)
+                   for argument in (flag,*pool)]
+        steps=[]
+        if all(len(pool)==1 for pool in spec.pools):
+            env.update(VPD_RUN_THREE_GPU_TESTS="1",VPD_TEST_STAGE_DEVICES=",".join(spec.devices))
+            steps.append(("three_gpu_tests",["tests/test_vpd_transport.py"],360))
+        elif spec.worker_count==4:
+            env.update(VPD_RUN_FOUR_GPU_TESTS="1",VPD_TEST_STAGE_POOLS=json.dumps(spec.pools),
+                       VPD_TEST_FOUR_GPU_DEVICES=",".join(spec.devices))
+            steps.append(("four_gpu_tests",["tests/test_vpd_pools.py"],360))
         for backend in ("gloo","nccl"):
             steps.append((f"probe_{backend}",["utils/probe_vpd_transport.py","--transport",backend,
                           *placement,"--output",str(args.output_dir/f"probe_{backend}.json")],240))

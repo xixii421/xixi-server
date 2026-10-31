@@ -1,7 +1,7 @@
 """单机三阶段通信：Gloo 传控制消息，Gloo 或 NCCL 传大张量。
 
 阅读顺序：TensorChannel -> send_kv -> receive_kv；视觉特征的交接在 vpd_local.py。
-rank 是进程在通信组中的编号：0=视觉 V，1=Prefill P，2=Decode D。
+rank 是进程在通信组中的编号，按 V 池、P 池、D 池展开，不能直接当作阶段编号。
 
 一次交接的顺序是：发送元数据 -> 发送张量 -> 接收端验证/就绪 -> 返回 ACK。
 ACK 是应用层的接收确认；本地发送完成并不代表对端已经验证并接管了数据。
@@ -40,16 +40,16 @@ class TensorChannel:
         """在默认 Gloo 组初始化后调用，建立并预热可选的 NCCL 数据组。"""
         group = None
         if spec.transport == "nccl":
-            # 三个进程必须以相同顺序创建通信组，并提前设置各自的当前 CUDA 设备。
+            # 所有进程必须以相同顺序创建通信组，并提前设置各自的当前 CUDA 设备。
             # 先做一次全员 collective，建立组通信，再让部分 rank 进行点对点传输。
-            group = dist.new_group(ranks=[0, 1, 2], backend="nccl",
+            group = dist.new_group(ranks=list(range(spec.worker_count)), backend="nccl",
                                    timeout=timedelta(seconds=timeout))
-            # 每个 rank 提供 1，SUM 后每张卡都应得到 3，作为启动握手检查。
+            # 每个 rank 提供 1，SUM 后每张卡都应得到 worker_count。
             probe = torch.ones(1, device=spec.device)
             dist.all_reduce(probe, group=group)
             torch.cuda.synchronize(spec.device)
-            if probe.item() != 3:
-                raise RuntimeError("NCCL three-rank bootstrap failed")
+            if probe.item() != spec.worker_count:
+                raise RuntimeError("NCCL worker-group bootstrap failed")
         return cls(spec.transport, spec.device, group=group,
                    verify_payload=spec.verify_payload)
 
@@ -142,6 +142,7 @@ def send_kv(channel, spec, request, result, first_token, ready_at, destination=2
               "dtype": spec.dtype, "first_token": first_token,
               "prompt_digest": hashlib.sha256(json.dumps(request["tokens"]).encode()).hexdigest(),
               "context_digest": request.get("context_digest", ""),
+              "route": request.get("route"),
               "first_token_ready_s": ready_at, "digests": [channel.digest(t) for t in tensors],
               "payload_format": "packed_kv_v1", "verify_payload": channel.verify_payload}
     # 接收端先拿到并验证头部，再按双方约定的尺寸接收 packed。

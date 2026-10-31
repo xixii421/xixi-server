@@ -182,6 +182,8 @@ def validate_header(header, spec, request, *, verify_payload=True):
         raise ValueError("KV handoff identity or model metadata mismatch")
     if header.get("context_digest", "") != request.get("context_digest", ""):
         raise ValueError("multimodal context identity mismatch")
+    if header.get("route") != request.get("route"):
+        raise ValueError("handoff worker route mismatch")
     first = header.get("first_token")
     if type(first) is not int or not 0 <= first < spec.config()["vocab_size"]:
         raise ValueError("invalid first token")

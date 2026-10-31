@@ -45,6 +45,14 @@ class ProbeCompletionTests(unittest.TestCase):
         self.assertEqual({sample["edge"] for sample in report["samples"]},{"V->P","P->D"})
         self.assertEqual(len(report["samples"]),4)  # 两条边，各验证 float32/bfloat16。
 
+    def test_probe_checks_every_candidate_edge_across_replica_pools(self):
+        spec=VModelSpec(stage_pools=(("cpu","cpu"),("cpu","cpu"),("cpu",)))
+        report=run_probe(spec,sizes=[1024],repeats=1,warmups=0,timeout=60)
+        self.assertEqual(report["worker_exitcodes"],[0]*5)
+        edges={(s["source_rank"],s["destination_rank"]) for s in report["samples"]}
+        self.assertEqual(edges,{(0,2),(0,3),(1,2),(1,3),(2,4),(3,4)})
+        self.assertEqual(len(report["samples"]),12)
+
 
 if __name__=="__main__":
     unittest.main(verbosity=2)

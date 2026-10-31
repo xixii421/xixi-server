@@ -1,12 +1,13 @@
-# 单机三卡 V/P/D 实现与验收
+# 单机多卡 V/P/D 设备池与验收
 
-当前新增代码支持三张独立 CUDA GPU，V/P/D 各由一个 spawn 进程运行。
-本机只有 RTX 4060 Laptop 一张卡；三卡 NCCL 点对点交接尚未获得真实硬件验收结果。
-本机通过的测试与待三卡验收的项目必须分别记录，不能把跳过用例算作通过。
+当前代码按 V/P/D 三个非空设备池启动副本，每个设备对应一个 spawn 工作进程。
+旧三卡配置仍兼容；四卡推荐 1V+1P+2D，也可配置更多副本和不同设备编号。
+本机只有 RTX 4060 Laptop 一张卡；多卡 NCCL 点对点交接尚未获得真实硬件验收结果。
+本机通过的测试与待多卡验收的项目必须分别记录，不能把跳过用例算作通过。
 
 ## 部署与依赖
 
-目标是 Linux/WSL 单机、三个可见 CUDA 设备，模型仍限定 Idefics3/SmolVLM。
+目标是 Linux/WSL 单机、每个副本独占一个可见 CUDA 设备，模型仍限定 Idefics3/SmolVLM。
 建议沿用已验证的 Python 3.10、PyTorch 2.6.0+cu124、Transformers 4.51.3：
 
 ```bash
@@ -14,9 +15,35 @@ python3.10 -m venv .venv-vpd
 .venv-vpd/bin/python -m pip install -r requirements-vpd-cuda.txt
 ```
 
-GPU 数量指同一台服务器的可见卡数。代码暂不支持多机、TP、DP 多副本和动态扩缩容。
+GPU 数量指同一台服务器的可见卡数。代码支持阶段副本池，暂不支持多机、TP、并行请求调度和动态扩缩容。
 P/D 分别持有语言模型权重，V 只把视觉模型和 Connector 放到自己的 GPU。
 每个工作进程先在 CPU 加载完整模型，再裁剪阶段模块并放到指定设备。
+
+## 四卡设备池
+
+本项目四卡默认推荐 1V+1P+2D，配置直接决定工作进程数量和阶段分工：
+
+```bash
+PYTHONPATH=src python -m lmm_serving.launcher vpd \
+  --model /path/to/SmolVLM-256M-Instruct --transport nccl \
+  --vision-devices cuda:0 --prefill-devices cuda:1 --decode-devices cuda:2 cuda:3
+```
+
+使用同一套配置验收，脚本名称保持兼容：
+
+```bash
+PYTHONPATH=src python utils/validate_vpd_multigpu.py \
+  --model /path/to/SmolVLM-256M-Instruct \
+  --vision-devices cuda:0 --prefill-devices cuda:1 --decode-devices cuda:2 cuda:3 \
+  --output-dir metrics/four-gpu-check-001
+```
+
+也支持 2V+1P+1D、1V+2P+1D，以及更多副本：三个池都必须非空，NCCL 下设备不能重复。
+这三组新参数需一起使用，且不能与旧 `--stage-devices` 混用。
+每请求在 V/P/D 池中各轮询一个副本；纯文本跳过 V。`route` 报告实际 global rank。
+目前请求串行，多 D 不代表并发吞吐增加；每个 V 拥有独立 CPU LRU，预算按每个 V 计算。
+多卡验收探针遍历所有 V×P、P×D 候选边，模型验收检查所有副本均参与。
+以下保留旧三卡的单副本示例和历史验证记录。
 
 ```bash
 PYTHONPATH=src .venv-vpd/bin/python -m lmm_serving.launcher vpd \
@@ -25,7 +52,7 @@ PYTHONPATH=src .venv-vpd/bin/python -m lmm_serving.launcher vpd \
   --vision-cache-mib 0 --port 8099
 ```
 
-启动器本身生成三个进程，直接运行即可，无需额外套 `torchrun`。
+启动器按设备池展开工作进程，直接运行即可，无需额外套 `torchrun`。
 默认 NCCL 映射也是 `cuda:0 cuda:1 cuda:2`，允许调换顺序。
 `CUDA_VISIBLE_DEVICES` 生效后参数使用逻辑编号。例如物理卡 2/4/6：
 
@@ -51,15 +78,15 @@ rank 2 / GPU D: 恢复 DynamicCache，逐 Token Decode
 ```
 
 - 默认进程组是 Gloo，专门处理 CPU 元数据和确认消息。
-- 三个 rank 按相同顺序创建 NCCL 数据组，执行一次全员 all-reduce 预热再进入 P2P。
+- 所有配置中的 rank 按相同顺序创建 NCCL 数据组，执行一次全员 all-reduce 预热再进入 P2P。
 - 每个进程在加载阶段权重前执行 `torch.cuda.set_device`，一进程使用一张卡。
 - KV 按 K0/V0/K1/V1 顺序打包成一个连续张量；接收形状由本地模型和请求计算。
 - 请求 UUID、序号、模型签名、prompt/context/image 顺序、dtype 和内存预算均继续校验。
 - 每次通信等待 Work 完成并同步该设备；接收端完成搬运和验证后再回 ACK。
   发送端保留源 KV、打包缓冲区或视觉特征直至 ACK，随后才能释放/复用。
-- 异常、超时或流式消费者断开后关闭整个运行时，清理三个进程。需要重启服务后继续。
+- 异常、超时或流式消费者断开后关闭整个运行时，清理所有工作进程。需要重启服务后继续。
 
-该实现是有界、串行请求的三卡服务，不声称计算通信重叠或跨请求流水线并发。
+该实现是有界、串行请求的多卡服务，不声称计算通信重叠或跨请求流水线并发。
 NCCL 内部选择 PCIe/P2P/SHM 等路径；仅凭使用 NCCL 不能宣称 NVLink、RDMA 或零拷贝。
 实现依据 [PyTorch 2.6 分布式文档](https://docs.pytorch.org/docs/2.6/distributed.html)
 中的设备独占、异步通信缓冲区生命周期及 CUDA Work 完成语义。
@@ -125,7 +152,7 @@ PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_multigpu.py \
 
 ```bash
 PYTHONPATH=src .venv-pd-cuda/bin/python utils/run_regressions.py \
-  --suites vpd_transport vpd vpd_tools vision_cache pd_local pd_service stream_benchmark launcher \
+  --suites vpd_transport vpd vpd_pools vpd_tools vision_cache pd_local pd_service stream_benchmark launcher \
   --timeout 180 --output-dir metrics/local-regression-new
 ```
 

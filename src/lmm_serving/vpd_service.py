@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .pd_service import PDHTTPServer
 from .vpd_local import LocalVPD, VModelSpec
-from .vpd_options import add_runtime_arguments
+from .vpd_options import add_runtime_arguments, placement_kwargs
 
 
 class VPDHTTPServer(PDHTTPServer):
@@ -26,7 +26,7 @@ class VPDHTTPServer(PDHTTPServer):
 def run(args):
     spec = VModelSpec(model_path=str(Path(args.model).resolve()) if args.model else None,
                       device=args.device,dtype=args.dtype,vision_cache_bytes=args.vision_cache_mib*1024*1024,
-                      stage_devices=tuple(args.stage_devices) if args.stage_devices else None,
+                      **placement_kwargs(args),
                       transport=args.transport,verify_payload=not args.no_handoff_checksum)
     with LocalVPD(spec,startup_timeout_s=args.startup_timeout,request_timeout_s=args.request_timeout) as runtime:
         server = VPDHTTPServer(("127.0.0.1",args.port),runtime)
@@ -34,6 +34,7 @@ def run(args):
                           "model":server.model_name,"device":spec.devices[0],"worker_pids":
                           [p.pid for p in runtime.processes],"stages":["vision","prefill","decode"],
                           "stage_devices":list(spec.devices),"transport":spec.transport,
+                          "stage_pools":[list(pool) for pool in spec.pools],"worker_info":runtime.worker_info,
                           "control_transport":"gloo","verify_payload":spec.verify_payload,
                           "scope":runtime.scope}),flush=True)
         try:
