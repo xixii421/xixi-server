@@ -79,6 +79,8 @@ def aggregate(records):
             "vision_stage_p50_ms":statistics.median([r["vision_ms"] for r in backend]) if backend and all("vision_ms" in r for r in backend) else None,
             "image_hit_rate":hits/images if images else None,"cache_hits":hits,"images":images,
             "encoded_images":sum(r.get("vision_images_encoded",0) for r in backend),
+            "vision_encoder_batch_images":sum(r.get("vision_encoder_batch_images",r.get("vision_images_encoded",0)) for r in backend),
+            "vision_padding_images":sum(r.get("vision_padding_images",0) for r in backend),
             "max_cache_resident_bytes":max([r.get("cache_resident_bytes",0) for r in backend],default=0)}
 
 

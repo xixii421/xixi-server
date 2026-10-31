@@ -1,11 +1,12 @@
 """Feature reuse correctness, bounded residency, and real-model integration."""
 import unittest
 import threading
+from unittest.mock import patch
 
 import torch
 
 from lmm_serving.vision_cache import VisionFeatureCache
-from lmm_serving.vpd_local import LocalVPD,VModelSpec,reference_generate
+from lmm_serving.vpd_local import LocalVPD,VModelSpec,reference_generate,encode_cached
 from lmm_serving.vpd_service import VPDHTTPServer
 from lmm_serving.stream_benchmark import measure
 from lmm_serving.monolithic_local import MonolithicVLM
@@ -55,6 +56,62 @@ class CacheTests(unittest.TestCase):
         cache.put("a",torch.ones(2))
         cache.put("a",torch.ones(1))
         self.assertEqual(cache.used_bytes,4)
+
+
+class EncodingShapeTests(unittest.TestCase):
+    """模拟随 batch 形状改变数值的编码器，保护跨命中状态的特征一致性。"""
+
+    @staticmethod
+    def inputs(values):
+        return {"pixel_values":torch.tensor(values,dtype=torch.float32).reshape(1,-1,1,1,1)}
+
+    @staticmethod
+    def encoder(spec,modules,inputs):
+        pixels=inputs["pixel_values"][0]
+        return pixels.flatten(1).sum(1).reshape(-1,1,1)*len(pixels)
+
+    def test_partial_hit_preserves_full_batch_features_and_reports_padding(self):
+        spec=VModelSpec()
+        cache=VisionFeatureCache(4096)
+        with patch("lmm_serving.vpd_local.encode_vision",side_effect=self.encoder):
+            encode_cached(spec,None,self.inputs([1,2]),["a","b"],cache)
+            inputs=self.inputs([1,3])
+            output,stats=encode_cached(spec,None,inputs,["a","c"],cache)
+            self.assertTrue(torch.equal(output,self.encoder(spec,None,inputs)))
+            self.assertEqual(stats["cache_hits"],1)
+            self.assertEqual(stats["vision_images_encoded"],1)
+            self.assertEqual(stats["vision_encoder_batch_images"],2)
+            self.assertEqual(stats["vision_padding_images"],1)
+
+    def test_single_and_multi_image_entries_do_not_share_batch_dependent_features(self):
+        spec=VModelSpec()
+        cache=VisionFeatureCache(4096)
+        with patch("lmm_serving.vpd_local.encode_vision",side_effect=self.encoder):
+            single=self.inputs([1])
+            encode_cached(spec,None,single,["a"],cache)
+            double=self.inputs([1,2])
+            output,stats=encode_cached(spec,None,double,["a","b"],cache)
+            self.assertTrue(torch.equal(output,self.encoder(spec,None,double)))
+            self.assertEqual(stats["cache_hits"],0)
+            output,stats=encode_cached(spec,None,single,["a"],cache)
+            self.assertTrue(torch.equal(output,self.encoder(spec,None,single)))
+            self.assertEqual(stats["cache_hits"],1)
+            self.assertEqual(stats["vision_encoder_batch_images"],0)
+
+    def test_duplicate_miss_preserves_batch_shape_then_reuses_both_positions(self):
+        spec=VModelSpec()
+        cache=VisionFeatureCache(4096)
+        inputs=self.inputs([1,1])
+        with patch("lmm_serving.vpd_local.encode_vision",side_effect=self.encoder):
+            output,stats=encode_cached(spec,None,inputs,["a","a"],cache)
+            self.assertTrue(torch.equal(output,self.encoder(spec,None,inputs)))
+            self.assertEqual(stats["intra_request_reuses"],1)
+            self.assertEqual(stats["vision_images_encoded"],1)
+            self.assertEqual(stats["vision_padding_images"],1)
+            repeated,stats=encode_cached(spec,None,inputs,["a","a"],cache)
+            self.assertTrue(torch.equal(repeated,output))
+            self.assertEqual(stats["cache_hits"],2)
+            self.assertEqual(stats["vision_encoder_batch_images"],0)
 
 
 class ReuseTests(unittest.TestCase):

@@ -334,9 +334,11 @@ def encode_cached(spec, modules, inputs, image_digests, cache):
             torch.cuda.synchronize(spec.device)
         return output,{"cache_hits":0,"cache_misses":len(image_digests),
                        "vision_images_encoded":len(image_digests),"intra_request_reuses":0,
+                       "vision_encoder_batch_images":len(image_digests),"vision_padding_images":0,
                        "vision_compute_ms":(time.perf_counter()-started)*1000,
                        "cache_evictions":0,"cache_resident_bytes":0,"cache_entries":0}
-    namespace=spec.signature()+":exif_rgb_no_split_fixed_longest_edge_v1:"
+    # BF16 编码的舍入可能随 batch 形状变化；同一图片的单图/双图结果不能混用。
+    namespace=spec.signature()+f":exif_rgb_no_split_fixed_longest_edge_v2:batch{len(image_digests)}:"
     keys=[namespace+digest for digest in image_digests]
     values={}
     misses={}
@@ -360,11 +362,14 @@ def encode_cached(spec, modules, inputs, image_digests, cache):
     evictions_before=cache.evictions
     if misses:
         indices=list(misses.values())
-        subset={"pixel_values":inputs["pixel_values"][:,indices]}
+        # 部分命中、重复图片去重后，仍保留完整请求的 encoder batch 大小。
+        # 补齐项只参与计算，不写缓存；显式记录补齐成本，不能把它算作省掉的计算。
+        encoder_indices=indices+[indices[0]]*(len(image_digests)-len(indices))
+        subset={"pixel_values":inputs["pixel_values"][:,encoder_indices]}
         if "pixel_attention_mask" in inputs:
-            subset["pixel_attention_mask"]=inputs["pixel_attention_mask"][:,indices]
+            subset["pixel_attention_mask"]=inputs["pixel_attention_mask"][:,encoder_indices]
         started=time.perf_counter()
-        encoded=encode_vision(spec,modules,subset).detach().cpu().contiguous()
+        encoded=encode_vision(spec,modules,subset)[:len(indices)].detach().cpu().contiguous()
         compute_ms=(time.perf_counter()-started)*1000
         for offset,key in enumerate(misses):
             values[key]=encoded[offset]
@@ -373,6 +378,8 @@ def encode_cached(spec, modules, inputs, image_digests, cache):
     state=cache.snapshot()
     return output,{"cache_hits":hits,"cache_misses":len(image_digests)-hits,
                    "vision_images_encoded":len(misses),"intra_request_reuses":duplicate_misses,
+                   "vision_encoder_batch_images":len(image_digests) if misses else 0,
+                   "vision_padding_images":len(image_digests)-len(misses) if misses else 0,
                    "vision_compute_ms":compute_ms,"cache_evictions":cache.evictions-evictions_before,
                    "cache_resident_bytes":state["resident_bytes"],"cache_entries":state["entries"]}
 

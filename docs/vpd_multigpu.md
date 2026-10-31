@@ -101,6 +101,9 @@ NCCL 内部选择 PCIe/P2P/SHM 等路径；仅凭使用 NCCL 不能宣称 NVLink
 指标中 `verify_payload=false` 会明确标注这个条件，验收输出应先通过开启校验的运行。
 
 视觉 LRU 仍为 CPU 缓存：启用后，视觉特征存入 CPU，命中后重新上传到 V 的 GPU 再发 NCCL。
+缓存按请求图数隔离条目；部分命中和重复图片去重时，以重复的未命中图片补齐 encoder batch，
+保持与完整模型相同的数值执行形状。`vision_encoder_batch_images` 和 `vision_padding_images`
+记录实际计算槽位与补齐成本，`vision_images_encoded` 只表示不同缺失图片数。
 因此，只有 **关闭视觉缓存且关闭完整载荷校验** 时，视觉特征交接才没有应用层整张量 CPU 中转；
 KV 在 NCCL 模式始终以 CUDA 张量传输，开启哈希时仍有校验用 CPU 镜像。
 图像预处理、控制信息本身在 CPU 上。不能把上述条件省略后声称整个服务“无 CPU 拷贝”。
