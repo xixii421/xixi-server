@@ -23,6 +23,8 @@ HTTP / SSE ── 主进程：请求入口、调度、Token 输出
 
 ## 安装与启动
 
+第一次租用 GPU 可按 [租卡与远程部署指南](docs/cloud_deploy.md) 操作，包含平台选择、SSH、代码克隆、模型上传和三卡验收。
+
 以下命令在仓库根目录执行，目标环境为 Linux/WSL、Python 3.10。准备本地 [SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) 目录，包含权重、模型配置和 processor/tokenizer 文件。
 
 ```bash
