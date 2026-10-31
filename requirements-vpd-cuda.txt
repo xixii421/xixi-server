@@ -1,0 +1,7 @@
+# Verified locally on Linux/WSL, Python 3.10. CPU env remains separate.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+numpy==2.2.6
+transformers==4.51.3
+safetensors==0.5.3
+Pillow==11.1.0

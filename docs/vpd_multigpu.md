@@ -1,0 +1,148 @@
+# 单机三卡 V/P/D 实现与验收
+
+当前新增代码支持三张独立 CUDA GPU，V/P/D 各由一个 spawn 进程运行。
+本机只有 RTX 4060 Laptop 一张卡；三卡 NCCL 点对点交接尚未获得真实硬件验收结果。
+本机通过的测试与待三卡验收的项目必须分别记录，不能把跳过用例算作通过。
+
+## 部署与依赖
+
+目标是 Linux/WSL 单机、三个可见 CUDA 设备，模型仍限定 Idefics3/SmolVLM。
+建议沿用已验证的 Python 3.10、PyTorch 2.6.0+cu124、Transformers 4.51.3：
+
+```bash
+python3.10 -m venv .venv-vpd
+.venv-vpd/bin/python -m pip install -r requirements-vpd-cuda.txt
+```
+
+GPU 数量指同一台服务器的可见卡数。代码暂不支持多机、TP、DP 多副本和动态扩缩容。
+P/D 分别持有语言模型权重，V 只把视觉模型和 Connector 放到自己的 GPU。
+每个工作进程先在 CPU 加载完整模型，再裁剪阶段模块并放到指定设备。
+
+```bash
+PYTHONPATH=src .venv-vpd/bin/python -m lmm_serving.launcher vpd \
+  --model /path/to/SmolVLM-256M-Instruct \
+  --transport nccl --stage-devices cuda:0 cuda:1 cuda:2 \
+  --vision-cache-mib 0 --port 8099
+```
+
+启动器本身生成三个进程，直接运行即可，无需额外套 `torchrun`。
+默认 NCCL 映射也是 `cuda:0 cuda:1 cuda:2`，允许调换顺序。
+`CUDA_VISIBLE_DEVICES` 生效后参数使用逻辑编号。例如物理卡 2/4/6：
+
+```bash
+CUDA_VISIBLE_DEVICES=2,4,6 PYTHONPATH=src .venv-vpd/bin/python -m lmm_serving.launcher vpd \
+  --model /path/to/SmolVLM-256M-Instruct --transport nccl \
+  --stage-devices cuda:0 cuda:1 cuda:2
+```
+
+`--device` 保留给共享设备 Gloo 模式以及工具的单模型参考设备；工作进程以
+`--stage-devices` 为准。NCCL 拒绝 CPU、重复占卡及不可见设备，不自动降级 Gloo。
+启动信息和 backend_metrics 返回实际 worker 设备、transport、校验模式。
+HTTP/SSE 请求方法、图片和生成预算与 [本机服务](vpd_local.md) 一致。
+
+## 数据通道与生命周期
+
+```text
+rank 0 / GPU V: Vision + Connector
+      |  Gloo: 有界 JSON 元数据；NCCL: 连续视觉特征；Gloo: ACK
+rank 1 / GPU P: 多模态 Prefill + 首 Token
+      |  Gloo: 有界 JSON 元数据；NCCL: 打包 KV；Gloo: ACK
+rank 2 / GPU D: 恢复 DynamicCache，逐 Token Decode
+```
+
+- 默认进程组是 Gloo，专门处理 CPU 元数据和确认消息。
+- 三个 rank 按相同顺序创建 NCCL 数据组，执行一次全员 all-reduce 预热再进入 P2P。
+- 每个进程在加载阶段权重前执行 `torch.cuda.set_device`，一进程使用一张卡。
+- KV 按 K0/V0/K1/V1 顺序打包成一个连续张量；接收形状由本地模型和请求计算。
+- 请求 UUID、序号、模型签名、prompt/context/image 顺序、dtype 和内存预算均继续校验。
+- 每次通信等待 Work 完成并同步该设备；接收端完成搬运和验证后再回 ACK。
+  发送端保留源 KV、打包缓冲区或视觉特征直至 ACK，随后才能释放/复用。
+- 异常、超时或流式消费者断开后关闭整个运行时，清理三个进程。需要重启服务后继续。
+
+该实现是有界、串行请求的三卡服务，不声称计算通信重叠或跨请求流水线并发。
+NCCL 内部选择 PCIe/P2P/SHM 等路径；仅凭使用 NCCL 不能宣称 NVLink、RDMA 或零拷贝。
+实现依据 [PyTorch 2.6 分布式文档](https://docs.pytorch.org/docs/2.6/distributed.html)
+中的设备独占、异步通信缓冲区生命周期及 CUDA Work 完成语义。
+
+## 校验与 CPU 视觉缓存
+
+默认开启完整载荷 SHA256 校验。CUDA 载荷为计算哈希会产生 CPU 镜像，适合正确性验收。
+性能实验可加 `--no-handoff-checksum`：仅关闭载荷哈希，仍验证元数据、顺序、形状和 ACK。
+指标中 `verify_payload=false` 会明确标注这个条件，验收输出应先通过开启校验的运行。
+
+视觉 LRU 仍为 CPU 缓存：启用后，视觉特征存入 CPU，命中后重新上传到 V 的 GPU 再发 NCCL。
+因此，只有 **关闭视觉缓存且关闭完整载荷校验** 时，视觉特征交接才没有应用层整张量 CPU 中转；
+KV 在 NCCL 模式始终以 CUDA 张量传输，开启哈希时仍有校验用 CPU 镜像。
+图像预处理、控制信息本身在 CPU 上。不能把上述条件省略后声称整个服务“无 CPU 拷贝”。
+
+## 三卡一键验收
+
+先上传代码和已有模型，再运行：
+
+```bash
+PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_multigpu.py \
+  --model /path/to/SmolVLM-256M-Instruct \
+  --stage-devices cuda:0 cuda:1 cuda:2 \
+  --output-dir metrics/three-gpu-acceptance-001
+```
+
+输出目录必须不存在。验收顺序：
+
+1. 检查三张不同的 CUDA 卡、Gloo/NCCL 和模型类型；不足三卡直接失败并输出原因。
+2. 保存 GPU/驱动、CUDA/NCCL 版本、CUDA_VISIBLE_DEVICES、GPU 拓扑和 peer-access 矩阵，
+   以及源码、模型文件 SHA256 和依赖版本。
+3. 启用真实三卡用例：缓存/非缓存路径、开启/关闭校验、文本旁路、多图换序、重复图片、
+   单 Token 生成及工作进程故障回收。没有足够硬件时这些用例报错，不静默跳过。
+4. 分别运行三卡 Gloo/NCCL 传输探针：72/144KiB 视觉量级和 1/8MiB KV 量级；
+   float32/bfloat16，两条边逐元素验证，多次采样延迟。
+5. 分别运行三卡 Gloo/NCCL 预训练模型验收：六类输入对齐单模型生成结果，检查 HTTP 非流式和 SSE。
+
+`report.json` 汇总是否通过；每步保留日志和独立 JSON。当前代码没有替你租卡、付费或连接服务器。
+
+探针测量的是包含发送端 staging、数据传输、接收端 staging/逐元素检查和 ACK 的完整交接延迟，
+不是原始 PCIe/NVLink 带宽。peer-access=false 不直接判定失败，NCCL 可能选择其他可用路径。
+
+## 性能实验
+
+在验收命令加 `--benchmark`，会另外为 Gloo 和 NCCL 分别运行既有 HTTP 消融：
+单模型、VPD 关闭缓存、VPD 开启缓存；热复用/冷图片/混合复用；默认三轮、每组 20 个请求。
+保留输出 token 一致性检查，关闭整张量 SHA256 以排除校验镜像开销。
+
+```bash
+PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_multigpu.py \
+  --model /path/to/SmolVLM-256M-Instruct --benchmark \
+  --requests 20 --rounds 3 --output-dir metrics/three-gpu-benchmark-001
+```
+
+单模型只占一张 GPU，三阶段占三张，报告会注明资源差别。它们的吞吐比较不能直接解释为
+等 GPU 预算下的扩容收益。Gloo/NCCL 对比使用相同的阶段映射；两个大块实验尚未交错随机化，
+有温度/频率漂移风险，不能把微小差异直接视为确定收益。
+
+首 Token 在 Prefill 完成时即可发送，因此 KV 通信的影响还需要看首/第二 Token 间隔、后续 TBT
+和 E2E，不能只看 TTFT。小模型三卡可能更慢，实测后据实记录。
+
+## 本机回归与简历边界
+
+```bash
+PYTHONPATH=src .venv-pd-cuda/bin/python utils/run_regressions.py \
+  --suites vpd_transport vpd vpd_tools vision_cache pd_local pd_service stream_benchmark launcher \
+  --timeout 180 --output-dir metrics/local-regression-new
+```
+
+本机单 GPU 可以验证 NCCL 组初始化、CUDA 张量准备、校验和同步 API，不能验证跨卡 P2P。
+三卡用例默认跳过，报告区分发现数量、执行数量和跳过数量。
+真实三卡验收以前，可表述“实现三阶段设备映射、NCCL 张量交接和三卡验收工具”；
+不能写“已完成三卡验证”或编写未经实测的多卡性能数字。
+
+上一轮三卡版本的本机验证记录：67 项单元/集成测试与 41 项启动器脚本检查通过；
+其中新增通信套件实际执行 12 项，包含单卡真实 NCCL API 测试，另有 2 项三卡测试跳过。
+预训练 SmolVLM 的六类输入、HTTP/SSE 在开启/关闭载荷校验的路径中均通过；
+CPU 与单卡 Gloo 传输探针通过，基准脚本冒烟的 18 条测量请求输出对齐。
+三卡验收入口在单卡硬件上按预期拒绝启动，没有把它计为三卡验收成功。
+见 [上一轮验证汇总](validation/three-gpu-implementation-20261031.json)。
+冒烟运行只有一轮、每场景两请求，用于验证脚本，不能替换此前正式简历性能实验。
+
+本轮架构整理与修复另见 [代码复查](code_review.md)，新验证记录保存在
+`metrics/vpd-architecture-review-20261031/`。配置/在线签名采用启动快照，
+HTTP 只准备一次输入；探针在销毁通信组并确认正常退出后才报告通过。
+公开测试摘要见 [本轮验证汇总](validation/architecture-review-20261031.json)，完整日志保存在运行机器的 metrics 目录。

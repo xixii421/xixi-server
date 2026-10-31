@@ -1,0 +1,167 @@
+{
+  "local_validation_passed": true,
+  "unit_tests_executed": 67,
+  "launcher_script_checks": 41,
+  "three_gpu_tests_skipped": 2,
+  "three_gpu_acceptance_completed": false,
+  "cross_gpu_performance_measured": false,
+  "single_gpu_nccl_api_smoke_passed": true,
+  "suites": [
+    {
+      "name": "vision_cache",
+      "returncode": 0,
+      "timed_out": false,
+      "executed_count": 8,
+      "count_kind": "tests",
+      "elapsed_s": 8.252411464998659,
+      "passed": true
+    },
+    {
+      "name": "pd_local",
+      "returncode": 0,
+      "timed_out": false,
+      "executed_count": 14,
+      "count_kind": "tests",
+      "elapsed_s": 18.977407131998916,
+      "passed": true
+    },
+    {
+      "name": "pd_service",
+      "returncode": 0,
+      "timed_out": false,
+      "executed_count": 5,
+      "count_kind": "tests",
+      "elapsed_s": 4.917538616999082,
+      "passed": true
+    },
+    {
+      "name": "stream_benchmark",
+      "returncode": 0,
+      "timed_out": false,
+      "executed_count": 14,
+      "count_kind": "tests",
+      "elapsed_s": 0.7170965060013259,
+      "passed": true
+    },
+    {
+      "name": "launcher",
+      "returncode": 0,
+      "timed_out": false,
+      "executed_count": 41,
+      "count_kind": "script_checks",
+      "elapsed_s": 0.26645672199992987,
+      "passed": true
+    },
+    {
+      "name": "vpd",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 0,
+      "executed_count": 14,
+      "count_kind": "tests",
+      "elapsed_s": 19.967407716998423,
+      "passed": true
+    },
+    {
+      "name": "vpd_transport",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 2,
+      "executed_count": 12,
+      "count_kind": "tests",
+      "elapsed_s": 6.090494478001347,
+      "passed": true
+    }
+  ],
+  "model_and_tool_checks": {
+    "tiny-acceptance.json": {
+      "passed": true,
+      "scope": "single-host V/P/D; Gloo control; host-staged Gloo payloads; serialized generation",
+      "model_spec": {
+        "model_path": null,
+        "dtype": "bfloat16",
+        "device": "cpu",
+        "seed": 42,
+        "threads": 2,
+        "max_prompt_tokens": 1024,
+        "max_new_tokens": 32,
+        "max_cache_bytes": 67108864,
+        "max_images": 2,
+        "max_image_bytes": 2097152,
+        "max_image_pixels": 1048576,
+        "max_feature_bytes": 4194304,
+        "vision_cache_bytes": 16777216,
+        "stage_devices": null,
+        "transport": "gloo",
+        "verify_payload": true
+      }
+    },
+    "smolvlm-gpu-checksum.json": {
+      "passed": true,
+      "scope": "single-host V/P/D; Gloo control; host-staged Gloo payloads; serialized generation",
+      "model_spec": {
+        "model_path": "/home/xixii/huggingface/SmolVLM-256M-Instruct",
+        "dtype": "bfloat16",
+        "device": "cuda:0",
+        "seed": 42,
+        "threads": 2,
+        "max_prompt_tokens": 1024,
+        "max_new_tokens": 32,
+        "max_cache_bytes": 67108864,
+        "max_images": 2,
+        "max_image_bytes": 2097152,
+        "max_image_pixels": 1048576,
+        "max_feature_bytes": 4194304,
+        "vision_cache_bytes": 16777216,
+        "stage_devices": null,
+        "transport": "gloo",
+        "verify_payload": true
+      }
+    },
+    "final-smolvlm-no-checksum.json": {
+      "passed": true,
+      "scope": "single-host V/P/D; Gloo control; host-staged Gloo payloads; serialized generation",
+      "model_spec": {
+        "model_path": "/home/xixii/huggingface/SmolVLM-256M-Instruct",
+        "dtype": "bfloat16",
+        "device": "cuda:0",
+        "seed": 42,
+        "threads": 2,
+        "max_prompt_tokens": 1024,
+        "max_new_tokens": 32,
+        "max_cache_bytes": 67108864,
+        "max_images": 2,
+        "max_image_bytes": 2097152,
+        "max_image_pixels": 1048576,
+        "max_feature_bytes": 4194304,
+        "vision_cache_bytes": 0,
+        "stage_devices": null,
+        "transport": "gloo",
+        "verify_payload": false
+      }
+    },
+    "probe-cpu.json": {
+      "passed": true,
+      "scope": "validated single-host handoff: sender staging + payload + receiver staging/equality + Gloo ACK; not raw link bandwidth",
+      "model_spec": null
+    },
+    "probe-gpu-gloo.json": {
+      "passed": true,
+      "scope": "validated single-host handoff: sender staging + payload + receiver staging/equality + Gloo ACK; not raw link bandwidth",
+      "model_spec": null
+    },
+    "benchmark-smoke/report.json": {
+      "passed": true,
+      "scope": "warmed HTTP/SSE; persistent full-model baseline; identical KV/greedy policy",
+      "model_spec": null
+    }
+  },
+  "expected_hardware_rejection": {
+    "passed": true,
+    "reason": "Three-GPU acceptance rejected the one-GPU laptop before spawning workers."
+  },
+  "benchmark_smoke_scope": "18 measured HTTP requests, one round, single physical GPU; script correctness only, not a resume performance result",
+  "scope": "One physical RTX 4060 Laptop; CPU/Gloo regressions, shared-GPU pretrained correctness and one-rank NCCL API test; no cross-GPU P2P claim"
+}

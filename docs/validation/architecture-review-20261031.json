@@ -1,0 +1,160 @@
+{
+  "local_validation_passed": true,
+  "unit_and_integration_tests_executed": 73,
+  "launcher_script_checks": 41,
+  "three_gpu_tests_skipped": 2,
+  "three_gpu_acceptance_completed": false,
+  "performance_claim_ready": false,
+  "suites": [
+    {
+      "name": "vpd",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 18,
+      "skipped_count": 0,
+      "executed_count": 18,
+      "count_kind": "tests",
+      "elapsed_s": 20.829134223000437,
+      "passed": true
+    },
+    {
+      "name": "vpd_transport",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 2,
+      "executed_count": 12,
+      "count_kind": "tests",
+      "elapsed_s": 6.3378464600027655,
+      "passed": true
+    },
+    {
+      "name": "vpd_tools",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 2,
+      "skipped_count": 0,
+      "executed_count": 2,
+      "count_kind": "tests",
+      "elapsed_s": 3.635303267998097,
+      "passed": true
+    },
+    {
+      "name": "vision_cache",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 8,
+      "skipped_count": 0,
+      "executed_count": 8,
+      "count_kind": "tests",
+      "elapsed_s": 8.655565101998945,
+      "passed": true
+    },
+    {
+      "name": "pd_local",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 0,
+      "executed_count": 14,
+      "count_kind": "tests",
+      "elapsed_s": 18.92723347699939,
+      "passed": true
+    },
+    {
+      "name": "pd_service",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 5,
+      "skipped_count": 0,
+      "executed_count": 5,
+      "count_kind": "tests",
+      "elapsed_s": 4.992269482001575,
+      "passed": true
+    },
+    {
+      "name": "stream_benchmark",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 0,
+      "executed_count": 14,
+      "count_kind": "tests",
+      "elapsed_s": 0.7156803920006496,
+      "passed": true
+    },
+    {
+      "name": "launcher",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 41,
+      "skipped_count": 0,
+      "executed_count": 41,
+      "count_kind": "script_checks",
+      "elapsed_s": 0.214725150999584,
+      "passed": true
+    }
+  ],
+  "pretrained_correctness": {
+    "smolvlm-checked.json": {
+      "passed": true,
+      "model_spec": {
+        "model_path": "/home/xixii/huggingface/SmolVLM-256M-Instruct",
+        "dtype": "bfloat16",
+        "device": "cuda:0",
+        "seed": 42,
+        "threads": 2,
+        "max_prompt_tokens": 1024,
+        "max_new_tokens": 32,
+        "max_cache_bytes": 67108864,
+        "max_images": 2,
+        "max_image_bytes": 2097152,
+        "max_image_pixels": 1048576,
+        "max_feature_bytes": 4194304,
+        "vision_cache_bytes": 16777216,
+        "stage_devices": null,
+        "transport": "gloo",
+        "verify_payload": true
+      },
+      "scope": "single-host V/P/D; Gloo control; host-staged Gloo payloads; serialized generation"
+    },
+    "smolvlm-unchecked.json": {
+      "passed": true,
+      "model_spec": {
+        "model_path": "/home/xixii/huggingface/SmolVLM-256M-Instruct",
+        "dtype": "bfloat16",
+        "device": "cuda:0",
+        "seed": 42,
+        "threads": 2,
+        "max_prompt_tokens": 1024,
+        "max_new_tokens": 32,
+        "max_cache_bytes": 67108864,
+        "max_images": 2,
+        "max_image_bytes": 2097152,
+        "max_image_pixels": 1048576,
+        "max_feature_bytes": 4194304,
+        "vision_cache_bytes": 0,
+        "stage_devices": null,
+        "transport": "gloo",
+        "verify_payload": false
+      },
+      "scope": "single-host V/P/D; Gloo control; host-staged Gloo payloads; serialized generation"
+    },
+    "benchmark-smoke/report.json": {
+      "passed": true,
+      "model_spec": null,
+      "scope": "warmed HTTP/SSE; persistent full-model baseline; identical KV/greedy policy"
+    }
+  },
+  "expected_hardware_rejection_passed": true,
+  "benchmark_smoke": {
+    "measured_requests": 18,
+    "rounds": 1,
+    "scope": "single-GPU script correctness; not a resume performance result"
+  },
+  "notes": [
+    "One physical RTX 4060 Laptop GPU; no cross-GPU P2P acceptance.",
+    "Probe tests cover a success event followed by nonzero exit and clean CPU/Gloo worker exitcodes.",
+    "Historical performance runs remain unchanged; current performance numbers await controlled measurement."
+  ]
+}

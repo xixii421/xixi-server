@@ -1,4 +1,6 @@
 import sys
+import shlex
+from unittest.mock import patch
 
 from lmm_serving.launcher import env, launch
 from lmm_serving.launcher import topology as topo
@@ -97,7 +99,7 @@ def test_ssh_transport():
     check("uses ssh -T", argv[:2] == ["ssh", "-T"])
     check("targets the node host", img.host in argv)
     remote = argv[-1]
-    check("cd to repo root", f"cd {env.REPO_ROOT}" in remote)
+    check("cd to repo root", shlex.split(remote)[:2] == ["cd", str(env.REPO_ROOT)])
     check("exec env (clean handoff)", "exec env" in remote)
     check("forwards IMAGE_NODE_RANK", "IMAGE_NODE_RANK=" in remote)
     check("runs the component", "image_node_manager.py" in remote)
@@ -125,8 +127,15 @@ def test_host_locality_mechanism():
 
 def test_validate():
     print("[topology validation]")
-    check("local modserve clean", topo.validate(topo.load("modserve")) == [])
-    check("local monolith clean", topo.validate(topo.load("monolith")) == [])
+    # Structural validation is independent of the machine executing the test.
+    # Separately verify the actual insufficient-hardware rejection path.
+    with patch.object(topo, "local_gpu_count", return_value=4):
+        check("local modserve clean", topo.validate(topo.load("modserve")) == [])
+        check("local monolith clean", topo.validate(topo.load("monolith")) == [])
+    with patch.object(topo, "local_gpu_count", return_value=1):
+        for setup in ("modserve", "monolith"):
+            check(f"single GPU rejects four-GPU {setup}",
+                  any("needs 4 GPUs but has 1" in error for error in topo.validate(topo.load(setup))))
 
     Node, Topology = topo.Node, topo.Topology
     # Image encoders always run TP1 (launch hardcodes it) — reject anything else.

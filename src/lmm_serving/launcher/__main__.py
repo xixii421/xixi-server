@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from datetime import datetime
 
 from lmm_serving import config as cfg
@@ -10,6 +11,11 @@ from . import launch
 from . import topology as topo
 
 SETUPS = ("monolith", "modserve")
+
+
+def _cmd_vpd(args, parser):
+    from lmm_serving.vpd_service import run
+    return run(args)
 
 
 def _cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -49,6 +55,17 @@ def _cmd_validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="launcher", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_vpd = sub.add_parser("vpd", help="run real local vision/prefill/decode service")
+    p_vpd.add_argument("--model", type=Path)
+    from lmm_serving.vpd_options import add_runtime_arguments
+    add_runtime_arguments(p_vpd)
+    p_vpd.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
+    p_vpd.add_argument("--port", type=int, default=8099)
+    p_vpd.add_argument("--vision-cache-mib", type=int, default=16)
+    p_vpd.add_argument("--startup-timeout", type=float, default=180)
+    p_vpd.add_argument("--request-timeout", type=float, default=60)
+    p_vpd.set_defaults(func=_cmd_vpd)
 
     # Independent CPU-only path; import the heavy learning dependencies only
     # when selected. Production topology and NCCL startup retain their semantics.

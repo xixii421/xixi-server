@@ -1,0 +1,7 @@
+# Separate CPU correctness environment. Do not install the production GPU stack.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+numpy==2.2.6
+transformers==4.51.3
+safetensors==0.5.3
+Pillow==11.1.0
