@@ -70,14 +70,19 @@ def main():
     parser.add_argument("--benchmark",action="store_true",help="also run paired Gloo/NCCL HTTP ablations")
     parser.add_argument("--requests",type=int,default=20)
     parser.add_argument("--rounds",type=int,default=3)
+    parser.add_argument("--concurrency",type=int,default=1,help="HTTP concurrency for optional benchmark")
+    parser.add_argument("--max-inflight",type=int,default=4,help="HTTP/runtime admission limit")
     args=parser.parse_args()
     if args.requests<1 or args.rounds<1:
         parser.error("requests and rounds must be positive")
+    if not 1<=args.concurrency<=args.max_inflight:
+        parser.error("concurrency must be positive and no greater than max-inflight")
     args.output_dir=args.output_dir.resolve()
     args.output_dir.mkdir(parents=True,exist_ok=False)
     report={"passed":False,"hardware_validated":False,"created_utc":datetime.now(timezone.utc).isoformat(),
             "steps":[],"is_performance_benchmark":args.benchmark,
-            "scope":"single-host V/P/D device-pool acceptance; serialized requests; no multi-node/RDMA/overlap claim"}
+            "benchmark_concurrency":args.concurrency,"max_inflight":args.max_inflight,
+            "scope":"single-host V/P/D device-pool acceptance; bounded request pipeline; no multi-node/RDMA or same-device asynchronous stream-overlap claim"}
     try:
         spec=VModelSpec(model_path=str(args.model.resolve()),transport="nccl",**placement_kwargs(args))
         spec.full_config()  # Reject unsupported model families before GPU work.
@@ -111,12 +116,14 @@ def main():
             steps.append((f"probe_{backend}",["utils/probe_vpd_transport.py","--transport",backend,
                           *placement,"--output",str(args.output_dir/f"probe_{backend}.json")],240))
             steps.append((f"model_{backend}",["utils/validate_vpd_model.py","--model",str(args.model.resolve()),
-                          "--transport",backend,*placement,"--output",str(args.output_dir/f"model_{backend}.json")],600))
+                          "--transport",backend,*placement,"--max-inflight",str(args.max_inflight),
+                          "--output",str(args.output_dir/f"model_{backend}.json")],600))
         if args.benchmark:
             for backend in ("gloo","nccl"):
                 steps.append((f"benchmark_{backend}",["utils/benchmark_vpd.py","--model",str(args.model.resolve()),
                               "--transport",backend,*placement,"--no-handoff-checksum",
                               "--rounds",str(args.rounds),"--requests",str(args.requests),
+                              "--concurrency",str(args.concurrency),"--max-inflight",str(args.max_inflight),
                               "--output-dir",str(args.output_dir/f"benchmark_{backend}")],3600))
         for name,arguments,timeout in steps:
             result=run_step(name,arguments,args.output_dir,env,timeout)

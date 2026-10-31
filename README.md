@@ -4,7 +4,7 @@
 
 在 [ModServe](https://github.com/Azure/ModServe) 派生仓库中新增 PyTorch / Transformers 后端，将真实多模态模型拆为三个阶段，按设备池启动各阶段副本，交接视觉特征与 KV Cache，提供 HTTP/SSE 接口、CPU 视觉特征 LRU，以及单机多卡 NCCL 传输实现。
 
-当前主线是一个便于验证和分析的推理服务：请求串行执行，阶段设备可独立配置。单卡真实模型与协议路径已经验证，**多卡点对点通信和性能待真实硬件验收**。
+当前主线支持按空闲阶段槽位分配路由、有界并发和背压，阶段设备可独立配置。单卡真实模型与协议路径已经验证，**多卡点对点通信和性能待真实硬件验收**。
 
 ## 架构
 
@@ -57,8 +57,10 @@ PYTHONPATH=src .venv-vpd/bin/python -m lmm_serving.launcher vpd \
 ```
 
 三个设备池都须非空，不能与旧 `--stage-devices V P D` 混用。设备可任意重新编号；
-NCCL 下每个副本独占一张可见 GPU。请求在各池独立轮询选择一个副本，当前仍串行执行；
-第二个 D 会实际轮流接收 KV 并解码，但这里不宣称两个 D 并行或吞吐翻倍。
+NCCL 下每个副本独占一张可见 GPU。请求从各池轮询选择空闲副本，固定整条路由；
+V/P 在交接确认后释放槽位，D 在生成完成后释放，因此 A 在 D2 解码时，B 可经过 V/P 交给 D3。
+每次路由提前预留一个 D，活动路由数最多为 D 副本数；其余已接纳请求在主进程 FIFO 等待。
+单 worker 顺序执行，不提供连续批处理或同 worker 的计算通信重叠，吞吐变化需在目标硬件实测。
 `backend_metrics.route`、`stage_pools` 和 `worker_info` 返回实际分配。
 
 没有 GPU 时，可按 [CPU 依赖](requirements-pd-local.txt) 创建独立环境，用 `--device cpu` 运行；省略 `--model` 会使用随机初始化的微型测试模型，只用于功能验证。
@@ -73,15 +75,16 @@ curl -N http://127.0.0.1:8099/v1/chat/completions \
   -d '{"model":"SmolVLM-256M-Instruct","messages":[{"role":"user","content":"Explain KV cache briefly."}],"max_tokens":8,"stream":true}'
 ```
 
-图片请求示例和完整限制见 [使用说明](docs/vpd_local.md)。当前支持 greedy、`n=1`、固定长度生成，最多 32 个输出 Token；最多两张图。HTTP 准入默认最多两个已接纳请求，实际模型执行由一把锁串行调度。
+图片请求示例和完整限制见 [使用说明](docs/vpd_local.md)。当前支持 greedy、`n=1`、固定长度生成，最多 32 个输出 Token；最多两张图。默认最多接纳 4 个请求，计入排队、执行及尚未返回的流式消费者，超出容量返回 429。事件泵按请求 ID 投递到独立收件箱，各 SSE 流分别按 Token index 输出。
 
 | 选项 | 用途 |
 |---|---|
 | `--vision-cache-mib 16` | CPU 视觉特征 LRU 预算，默认 16MiB；设为 `0` 关闭 |
 | `--transport gloo` | CPU 张量交接，支持单卡或指定的阶段设备 |
-| `--transport nccl` | CUDA 张量交接，要求三张不同的可见 GPU |
+| `--transport nccl` | CUDA 张量交接，至少三张可见 GPU，每个 worker 独占一张 |
 | `--stage-devices V P D` | 分别指定视觉、Prefill、Decode 设备 |
 | `--vision-devices … --prefill-devices … --decode-devices …` | 为各阶段配置非空设备池，进程数由配置决定 |
+| `--max-inflight 4` | 已接纳请求总上限；空闲阶段不足时在主进程排队 |
 | `--no-handoff-checksum` | 关闭完整载荷 SHA256，保留元数据和 ACK 检查 |
 
 完整载荷校验会把 CUDA 数据复制到 CPU 做哈希；视觉 LRU 也存于 CPU。性能实验需记录这两个开关，不能将默认路径描述成“全程零拷贝”。
@@ -92,7 +95,7 @@ curl -N http://127.0.0.1:8099/v1/chat/completions \
 
 ```bash
 PYTHONPATH=src .venv-vpd/bin/python utils/run_regressions.py \
-  --suites vpd_transport vpd vpd_pools vpd_tools vision_cache pd_local pd_service stream_benchmark launcher \
+  --suites vpd_router vpd_parallel vpd_transport vpd vpd_pools vpd_tools vision_cache pd_local pd_service stream_benchmark launcher \
   --timeout 180 --output-dir metrics/local-check-001
 ```
 
@@ -110,6 +113,8 @@ PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_multigpu.py \
 四卡或其它副本分配使用同一个验收脚本，把 `--stage-devices` 换成上面的三组设备池参数。
 传输探针覆盖所有 V×P 和 P×D 候选连接，模型验收要求每个副本实际处理请求。
 本机设备池回归和四进程单卡回环结果见 [验证摘要](docs/validation/device-pools-20261031.json)，不代表真实四卡验收。
+并发压测为 `benchmark_vpd.py` 增加 `--concurrency 2 --max-inflight 4`，或在一键验收时同时加 `--benchmark --concurrency 2`。并发度默认仍为 1，须显式设置；吞吐按整组请求的墙钟时间计算。
+并发路由的 [验证摘要](docs/validation/parallel-routing-20261031.json) 记录 103 项单元/集成测试、41 项启动器检查及真实 SmolVLM 并发冒烟；3 项多卡用例因硬件不足跳过。
 
 - [多卡设备池、验收和测量方法](docs/vpd_multigpu.md)
 - [历史单卡消融实验](docs/vpd_benchmark.md)：保留当时源码和原始记录，不能作为当前三卡结果。
@@ -126,6 +131,7 @@ PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_multigpu.py \
 |---|---|
 | `src/lmm_serving/vpd_service.py` | 服务配置与 HTTP 适配 |
 | `src/lmm_serving/vpd_local.py` | 模型阶段、输入准备、V/P/D 请求编排 |
+| `src/lmm_serving/vpd_router.py` | 空闲副本选择、路由预留与阶段槽位释放 |
 | `src/lmm_serving/vpd_transport.py` | 张量通道、KV 打包、接收恢复与 ACK |
 | `src/lmm_serving/vision_cache.py` | 由 V 进程独占的 CPU 字节级 LRU |
 | `src/lmm_serving/pd_local.py`、`pd_service.py` | 共享进程/HTTP 基础设施及早期 Qwen3 文本 PD 参考路径 |

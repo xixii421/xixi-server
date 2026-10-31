@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suites", nargs="+", choices=SUITES+("pd_local", "pd_service", "vpd","vision_cache", "vpd_transport", "vpd_tools", "vpd_pools"), default=list(SUITES))
+    parser.add_argument("--suites", nargs="+", choices=SUITES+("pd_local", "pd_service", "vpd","vision_cache", "vpd_transport", "vpd_tools", "vpd_pools", "vpd_router", "vpd_parallel"), default=list(SUITES))
     parser.add_argument("--timeout", type=float, default=120, help="per-suite wall timeout")
     parser.add_argument("--output-dir", type=Path, required=True, help="new directory; never overwrites")
     args = parser.parse_args()

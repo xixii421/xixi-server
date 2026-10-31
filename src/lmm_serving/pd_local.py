@@ -368,12 +368,13 @@ class LocalPD:
                           scope="local worker token readiness; not client streaming or cross-GPU")
             return result
 
-    def collect(self, request, deadline, on_token=None, expected=("handoff", "result")):
+    def collect(self, request, deadline, on_token=None, expected=("handoff", "result"), *, event_source=None):
         """主进程收集 worker 事件：完成消息可以交错到达，Token 必须按编号输出。"""
         received, token_events, emitted = {}, {}, 0
+        event_source = event_source or self._event
         try:
             while len(received) < len(expected) or emitted < request["new_tokens"]:
-                event = self._event(deadline)
+                event = event_source(deadline)
                 if event.get("request_id") != request["request_id"]:
                     raise RuntimeError("unexpected request identity or channel event")
                 if event["type"] == "token":
@@ -405,6 +406,10 @@ class LocalPD:
         if self._closed:
             return
         self._closed = True
+        self._cleanup_processes()
+
+    def _cleanup_processes(self):
+        """只清理进程与队列；并发运行时自行决定谁执行一次性关闭。"""
         for control in self.controls:
             control.put(None)
         for process in self.processes:

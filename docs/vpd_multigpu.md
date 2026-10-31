@@ -15,7 +15,7 @@ python3.10 -m venv .venv-vpd
 .venv-vpd/bin/python -m pip install -r requirements-vpd-cuda.txt
 ```
 
-GPU 数量指同一台服务器的可见卡数。代码支持阶段副本池，暂不支持多机、TP、并行请求调度和动态扩缩容。
+GPU 数量指同一台服务器的可见卡数。代码支持阶段副本池和有界并发路由，暂不支持多机、TP、连续批处理和动态扩缩容。
 P/D 分别持有语言模型权重，V 只把视觉模型和 Connector 放到自己的 GPU。
 每个工作进程先在 CPU 加载完整模型，再裁剪阶段模块并放到指定设备。
 
@@ -40,8 +40,11 @@ PYTHONPATH=src python utils/validate_vpd_multigpu.py \
 
 也支持 2V+1P+1D、1V+2P+1D，以及更多副本：三个池都必须非空，NCCL 下设备不能重复。
 这三组新参数需一起使用，且不能与旧 `--stage-devices` 混用。
-每请求在 V/P/D 池中各轮询一个副本；纯文本跳过 V。`route` 报告实际 global rank。
-目前请求串行，多 D 不代表并发吞吐增加；每个 V 拥有独立 CPU LRU，预算按每个 V 计算。
+每请求在 V/P/D 池中各轮询一个空闲副本，原子预留整条路由；纯文本跳过 V。`route` 报告实际 global rank。
+V/P 在交接完成后释放，D 在生成结束后释放，支持不同请求的阶段重叠和多 D 并行。
+默认 `--max-inflight 4` 限制已接纳请求；资源不足时在主进程 FIFO 等待，超额返回 429。
+D 提前预留，活动路由数最多等于 D 副本数；单 D 配置仍只有一个活动路由。
+每个 V 拥有独立 CPU LRU，预算按每个 V 计算。
 多卡验收探针遍历所有 V×P、P×D 候选边，模型验收检查所有副本均参与。
 以下保留旧三卡的单副本示例和历史验证记录。
 
@@ -86,7 +89,7 @@ rank 2 / GPU D: 恢复 DynamicCache，逐 Token Decode
   发送端保留源 KV、打包缓冲区或视觉特征直至 ACK，随后才能释放/复用。
 - 异常、超时或流式消费者断开后关闭整个运行时，清理所有工作进程。需要重启服务后继续。
 
-该实现是有界、串行请求的多卡服务，不声称计算通信重叠或跨请求流水线并发。
+该实现支持有界的跨请求阶段重叠，每个 worker 内顺序执行，不声称同 worker 的计算通信 stream 重叠。
 NCCL 内部选择 PCIe/P2P/SHM 等路径；仅凭使用 NCCL 不能宣称 NVLink、RDMA 或零拷贝。
 实现依据 [PyTorch 2.6 分布式文档](https://docs.pytorch.org/docs/2.6/distributed.html)
 中的设备独占、异步通信缓冲区生命周期及 CUDA Work 完成语义。
@@ -141,6 +144,13 @@ PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_multigpu.py \
   --requests 20 --rounds 3 --output-dir metrics/three-gpu-benchmark-001
 ```
 
+验证四卡 1V+1P+2D 的并发时，将上述设备参数换为三组设备池，并显式增加
+`--concurrency 2 --max-inflight 4`。不加 `--concurrency` 时客户端仍按并发 1 测量。
+可分别用并发 1/2/4 测量排队与吞吐，保持布局、负载、输出长度和缓存开关一致。
+`queue_wait_ms` 记录后端路由等待，`decode_started_s/decode_finished_s` 可检查同机解码区间是否相交；
+时间区间重叠只证明调度并发，吞吐收益按整组请求墙钟时间另行计算。
+单体基线使用相同客户端并发与接纳上限，模型执行仍串行。
+
 单模型只占一张 GPU，三阶段占三张，报告会注明资源差别。它们的吞吐比较不能直接解释为
 等 GPU 预算下的扩容收益。Gloo/NCCL 对比使用相同的阶段映射；两个大块实验尚未交错随机化，
 有温度/频率漂移风险，不能把微小差异直接视为确定收益。
@@ -152,7 +162,7 @@ PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_multigpu.py \
 
 ```bash
 PYTHONPATH=src .venv-pd-cuda/bin/python utils/run_regressions.py \
-  --suites vpd_transport vpd vpd_pools vpd_tools vision_cache pd_local pd_service stream_benchmark launcher \
+  --suites vpd_router vpd_parallel vpd_transport vpd vpd_pools vpd_tools vision_cache pd_local pd_service stream_benchmark launcher \
   --timeout 180 --output-dir metrics/local-regression-new
 ```
 

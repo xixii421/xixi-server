@@ -1,0 +1,174 @@
+{
+  "local_validation_passed": true,
+  "created_utc": "2026-10-31T14:36:58.007255+00:00",
+  "unit_and_integration_tests_executed": 103,
+  "launcher_script_checks": 41,
+  "gpu_acceptance_tests_skipped": 3,
+  "real_multi_gpu_acceptance_completed": false,
+  "suites": [
+    {
+      "name": "vpd_router",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 9,
+      "skipped_count": 0,
+      "executed_count": 9,
+      "count_kind": "tests",
+      "elapsed_s": 0.06412407700008771,
+      "passed": true
+    },
+    {
+      "name": "vpd_parallel",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 5,
+      "skipped_count": 0,
+      "executed_count": 5,
+      "count_kind": "tests",
+      "elapsed_s": 24.83892443900004,
+      "passed": true
+    },
+    {
+      "name": "vpd",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 18,
+      "skipped_count": 0,
+      "executed_count": 18,
+      "count_kind": "tests",
+      "elapsed_s": 21.054534663999675,
+      "passed": true
+    },
+    {
+      "name": "vpd_pools",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 16,
+      "skipped_count": 1,
+      "executed_count": 15,
+      "count_kind": "tests",
+      "elapsed_s": 17.901470480999706,
+      "passed": true
+    },
+    {
+      "name": "pd_local",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 0,
+      "executed_count": 14,
+      "count_kind": "tests",
+      "elapsed_s": 24.82136721900133,
+      "passed": true
+    },
+    {
+      "name": "pd_service",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 5,
+      "skipped_count": 0,
+      "executed_count": 5,
+      "count_kind": "tests",
+      "elapsed_s": 5.887186168998596,
+      "passed": true
+    },
+    {
+      "name": "vpd_transport",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 2,
+      "executed_count": 12,
+      "count_kind": "tests",
+      "elapsed_s": 6.742378165001355,
+      "passed": true
+    },
+    {
+      "name": "vpd_tools",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 3,
+      "skipped_count": 0,
+      "executed_count": 3,
+      "count_kind": "tests",
+      "elapsed_s": 5.792443205999007,
+      "passed": true
+    },
+    {
+      "name": "vision_cache",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 8,
+      "skipped_count": 0,
+      "executed_count": 8,
+      "count_kind": "tests",
+      "elapsed_s": 9.502334661001441,
+      "passed": true
+    },
+    {
+      "name": "stream_benchmark",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 14,
+      "skipped_count": 0,
+      "executed_count": 14,
+      "count_kind": "tests",
+      "elapsed_s": 0.716110965999178,
+      "passed": true
+    },
+    {
+      "name": "launcher",
+      "returncode": 0,
+      "timed_out": false,
+      "discovered_count": 41,
+      "skipped_count": 0,
+      "executed_count": 41,
+      "count_kind": "script_checks",
+      "elapsed_s": 0.2149076799996692,
+      "passed": true
+    }
+  ],
+  "parallel_regressions": [
+    "two real tiny-model decoders overlap and preserve request-specific token callbacks",
+    "concurrent HTTP/SSE streams match independent unsplit references",
+    "four admitted requests queue and reuse stage slots without decoder self-overlap",
+    "capacity rejection has status 429 and runtime recovers after consumer completion",
+    "consumer failure wakes peer request and reaps all workers"
+  ],
+  "deterministic_overlap_test_scope": "CPU tiny Idefics3 with test-only 40ms decode delay; not a performance measurement",
+  "pretrained_concurrent_http_smoke": {
+    "passed": true,
+    "model": "SmolVLM-256M-Instruct",
+    "dtype": "bfloat16",
+    "physical_gpus": 1,
+    "transport": "gloo",
+    "stage_pools": [
+      [
+        "cuda:0"
+      ],
+      [
+        "cuda:0"
+      ],
+      [
+        "cuda:0",
+        "cuda:0"
+      ]
+    ],
+    "concurrency": 2,
+    "max_inflight": 4,
+    "measured_requests": 18,
+    "vpd_requests": 12,
+    "correctness_mismatches": [],
+    "decoder_ranks_used": [
+      2,
+      3
+    ],
+    "vpd_cohorts_with_observed_decode_interval_overlap": 6,
+    "vpd_cohorts_total": 6,
+    "scope": "One round, two requests per scenario/mode, one shared GPU; functional evidence only, no multi-GPU performance claim"
+  },
+  "validator_max_inflight_cli_honored": true,
+  "raw_evidence_directory": "metrics/vpd-parallel-20261031",
+  "release_source_manifest_sha256": "9e8e72d49828111d43a539e7e969029091c5293bf717ec8d5600553519f19da5",
+  "scope": "Bounded concurrent stage routing; one request per worker; V/P release after ACK; D reserved at route admission and released after generation; no continuous batching or same-worker asynchronous stream-overlap claim"
+}

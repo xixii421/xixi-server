@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from functools import cached_property
 import gc
 import hashlib
 import io
 import json
+import queue
 from pathlib import Path
 import tempfile
+import threading
 import time
 import uuid
 
@@ -23,10 +26,25 @@ import torch.distributed as dist
 from .pd_local import LocalPD, ModelSpec, receive_header, send_header, validate_device
 from .vision_cache import VisionFeatureCache
 from .vpd_transport import TensorChannel, send_kv, receive_kv
+from .vpd_router import StageRouter
 
 
 class LimitError(ValueError):
     status_code = 413
+
+
+class CapacityError(RuntimeError):
+    status_code = 429
+
+
+@dataclass
+class _RequestState:
+    request: dict
+    deadline: float
+    inbox: queue.Queue = field(default_factory=queue.Queue)
+    completed: set = field(default_factory=set)
+    rejected: bool = False
+    queue_wait_ms: float = 0
 
 
 @dataclass(frozen=True)
@@ -101,7 +119,7 @@ class VModelSpec(ModelSpec):
     @property
     def scope(self):
         payload = ("NCCL CUDA payloads" if self.transport == "nccl" else "host-staged Gloo payloads")
-        return f"single-host V/P/D; Gloo control; {payload}; serialized generation"
+        return f"single-host V/P/D; Gloo control; {payload}; bounded concurrent stage routing"
 
     def check_hardware(self):
         """Reject unavailable cards/backends before spawning expensive workers."""
@@ -430,6 +448,9 @@ def vpd_worker(rank,spec,store,control,events,timeout):
     2. 默认 Gloo 组：worker 之间的 JSON 头和 CPU ACK。
     3. channel：worker 之间的大张量，按配置使用 CPU/Gloo 或 CUDA/NCCL。
     """
+    def publish(event):
+        events.put({**event,"rank":rank})
+
     channel = None
     try:
         # rank 是进程编号，不等于 GPU 编号；实际映射由 stage_devices 决定。
@@ -447,7 +468,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                                 timeout=timedelta(seconds=timeout))
         channel = TensorChannel.start(spec,timeout)
         # ready 表示权重加载和通信预热均已成功，主进程收齐所有副本后才接请求。
-        events.put({"type":"ready","rank":rank,"device":spec.device,
+        publish({"type":"ready","rank":rank,"device":spec.device,
                     "stage":("vision","prefill","decode")[stage],
                     "transport":spec.transport,"verify_payload":spec.verify_payload})
         while True:
@@ -468,7 +489,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                     if tuple(tensor.shape) != expected_shape or tensor.numel()*tensor.element_size() > spec.max_feature_bytes:
                         raise ValueError("visual output exceeds expected shape or budget")
                 except ValueError as error:
-                    events.put({"type":"reject","request_id":request["request_id"],"error":str(error)})
+                    publish({"type":"reject","request_id":request["request_id"],"error":str(error)})
                     del inputs,tensor,request
                     continue  # 此时还没开始阶段间通信，拒绝本请求后仍可安全接下一次。
                 tensor = channel.prepare(tensor)
@@ -476,7 +497,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                 # 必须先把展开后的 tokens 通知主进程，再发送特征。
                 # 主进程据此向 P/D 下发请求；如果 V 先阻塞等 P 接收，而主进程
                 # 还不知道 tokens、未唤醒 P，就会形成相互等待。
-                events.put({"type":"vision_ready","request_id":request["request_id"],
+                publish({"type":"vision_ready","request_id":request["request_id"],
                             "tokens":request["tokens"],"feature_digest":header["digest"]})
                 encoded = time.perf_counter()
                 # V -> P：头部(Gloo) -> 特征(channel) -> 接管确认(Gloo)。
@@ -487,7 +508,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                 dist.recv(ack,src=destination)
                 if ack.item() != request["sequence"]:
                     raise ValueError("visual acknowledgement mismatch")
-                events.put({"type":"vision_handoff","request_id":request["request_id"],
+                publish({"type":"vision_handoff","request_id":request["request_id"],
                             "vision_ms":(encoded-started)*1000,
                             "vision_transfer_ms":(time.perf_counter()-encoded)*1000,
                             "feature_bytes":tensor.numel()*tensor.element_size(),
@@ -502,9 +523,9 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                 ready_at = time.perf_counter()
                 # Prefill 得到“prompt 的 KV”和“首个生成 Token”。先通知客户端首
                 # Token，再交接 KV，因此 KV 传输开销还应看首/第二 Token 间隔。
-                events.put({"type":"token","request_id":request["request_id"],"index":0,"token":first})
+                publish({"type":"token","request_id":request["request_id"],"index":0,"token":first})
                 send_kv(channel,spec,request,result,first,ready_at,destination=request["route"]["decode"])
-                events.put({"type":"handoff","request_id":request["request_id"],
+                publish({"type":"handoff","request_id":request["request_id"],
                             "prefill_ms":(ready_at-started)*1000,
                             "handoff_ms":(time.perf_counter()-ready_at)*1000,
                             "prefill_feature_digest":feature_digest})
@@ -512,6 +533,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
             else:
                 # D：用收到的 prompt KV 续算。首 Token 已有，不重算完整 prompt。
                 cache,header = receive_kv(channel,spec,request,source=request["route"]["prefill"])
+                decode_started = time.perf_counter()
                 output,times = [header["first_token"]],[header["first_token_ready_s"]]
                 for index in range(1,request["new_tokens"]):
                     # 每步仅输入上一个 Token；历史上下文由不断增长的 KV 提供。
@@ -519,8 +541,10 @@ def vpd_worker(rank,spec,store,control,events,timeout):
                     cache = result.past_key_values
                     output.append(int(result.logits[0,-1].argmax()))
                     times.append(time.perf_counter())
-                    events.put({"type":"token","request_id":request["request_id"],"index":index,"token":output[-1]})
-                events.put({"type":"result","request_id":request["request_id"],"token_ids":output,
+                    publish({"type":"token","request_id":request["request_id"],"index":index,"token":output[-1]})
+                decode_finished = time.perf_counter()
+                publish({"type":"result","request_id":request["request_id"],"token_ids":output,
+                            "decode_started_s":decode_started,"decode_finished_s":decode_finished,
                             "token_ready_times_s":times,"decode_input_lengths":[1]*(len(output)-1),
                             "received_cache_tokens":len(request["tokens"]),
                             "decode_context_digest":header["context_digest"]})
@@ -531,7 +555,7 @@ def vpd_worker(rank,spec,store,control,events,timeout):
     except BaseException as error:
         # 一旦开始阶段间通信，异常可能让另一端停在 recv/send。
         # 通知主进程统一关闭全部 worker，避免在状态不确定的通道上继续服务。
-        events.put({"type":"error","rank":rank,"error":f"{type(error).__name__}: {error}"})
+        publish({"type":"error","rank":rank,"error":f"{type(error).__name__}: {error}"})
     finally:
         if dist.is_initialized():
             try:
@@ -543,19 +567,22 @@ def vpd_worker(rank,spec,store,control,events,timeout):
 
 
 class LocalVPD(LocalPD):
-    def __init__(self,spec=VModelSpec(),**kwargs):
+    def __init__(self,spec=VModelSpec(),*,max_inflight=4,**kwargs):
+        if type(max_inflight) is not int or max_inflight < 1:
+            raise ValueError("max_inflight must be a positive integer")
         super().__init__(spec,**kwargs)
         self.controls.extend(self.context.Queue() for _ in range(spec.worker_count-len(self.controls)))
+        self.max_inflight = max_inflight
+        self._condition = threading.Condition()
+        self._stopped = threading.Event()
+        self._pump_thread = None
+        self._requests = {}
+        self._pending = deque()
+        self._router = StageRouter(spec)
+        self._stop_error = None
         self.processor = load_processor(spec)
         self.scope = spec.scope
         self.worker_info = []
-        self._stage_cursors = [0,0,0]
-
-    def _select_worker(self,stage):
-        pool = self.spec.ranks_for(stage)
-        rank = pool[self._stage_cursors[stage] % len(pool)]
-        self._stage_cursors[stage] += 1
-        return rank
 
     def __enter__(self):
         # 主进程不加入通信组，只负责预检、启动与调度。
@@ -582,10 +609,84 @@ class LocalVPD(LocalPD):
                 ready.add(event["rank"])
                 self.worker_info.append(event)
             self.worker_info.sort(key=lambda event:event["rank"])
+            self._pump_thread = threading.Thread(target=self._pump_events,name="vpd-events",daemon=True)
+            self._pump_thread.start()
             return self
         except BaseException:
             self.close()
             raise
+
+    def _pump_events(self):
+        """唯一读取 worker 事件的线程：验归属、释放阶段槽位、按请求投递。"""
+        completion_stages={"vision_handoff":"vision","handoff":"prefill","result":"decode"}
+        try:
+            while not self._closed:
+                try:
+                    event = self._event(time.monotonic()+.1)
+                except TimeoutError:
+                    event = None
+                with self._condition:
+                    if self._closed:
+                        return
+                    for state in self._requests.values():
+                        route = state.request.get("route")
+                        required={name for name,rank in route.items() if rank is not None} if route else set()
+                        if (route and not state.rejected and state.completed != required
+                                and time.monotonic() >= state.deadline):
+                            raise TimeoutError("active VPD request deadline exceeded")
+                    if event is None:
+                        continue
+                    state = self._requests.get(event.get("request_id"))
+                    if state is None:
+                        raise RuntimeError("unknown VPD request event")
+                    kind = event["type"]
+                    stage = completion_stages.get(kind)
+                    if kind in ("vision_ready","reject"):
+                        stage = "vision"
+                    elif kind == "token":
+                        stage = "prefill" if event["index"] == 0 else "decode"
+                    if stage is None or event.get("rank") != state.request["route"][stage]:
+                        raise RuntimeError("worker event does not match request route")
+                    if kind in completion_stages:
+                        self._router.release_stage(state.request["request_id"],stage)
+                        state.completed.add(stage)
+                    elif kind == "reject":
+                        state.rejected = True
+                    state.inbox.put(event)
+                    self._condition.notify_all()
+        except BaseException as error:
+            self.close(error=RuntimeError(f"VPD runtime stopped: {error}"))
+
+    def _wait_route(self,state):
+        request = state.request
+        with self._condition:
+            while True:
+                if self._closed:
+                    raise RuntimeError(str(self._stop_error or "VPD runtime is closed"))
+                remaining = state.deadline-time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("VPD route queue deadline exceeded")
+                if self._pending[0] == request["request_id"]:
+                    route = self._router.acquire(request["request_id"],bool(request["image_count"]))
+                    if route is not None:
+                        request["route"] = route
+                        self._pending.popleft()
+                        state.queue_wait_ms = (time.perf_counter()-request["started_s"])*1000
+                        self._condition.notify_all()
+                        return route
+                self._condition.wait(timeout=min(.1,remaining))
+
+    def _request_event(self,state,deadline):
+        remaining = deadline-time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("VPD request deadline exceeded")
+        try:
+            event = state.inbox.get(timeout=remaining)
+        except queue.Empty:
+            raise TimeoutError("VPD request deadline exceeded") from None
+        if isinstance(event,BaseException):
+            raise event
+        return event
 
     def prepare(self,messages,new_tokens=8):
         return prepare_request(self.spec,messages,new_tokens)
@@ -596,59 +697,60 @@ class LocalVPD(LocalPD):
     def run_prepared(self,prepared,*,on_token=None):
         normalized,images,new_tokens = prepared.messages,prepared.images,prepared.new_tokens
         digests = [hashlib.sha256(image).hexdigest() for image in images]
-        # 当前只有一条串行交接通道。锁覆盖完整请求，保证头/载荷/ACK 的顺序；
-        # 请求 UUID 和序号用于校验，不能替代真正的并发多路复用协议。
-        with self._lock:
+        # 只在登记/路由/释放时持锁。模型执行与用户回调不持有调度锁。
+        with self._condition:
             if self._closed or len(self.processes)!=self.spec.worker_count:
                 raise RuntimeError("VPD runtime is not active")
+            if len(self._requests) >= self.max_inflight:
+                raise CapacityError("VPD admission capacity exhausted")
             self._sequence += 1
-            route = {"vision":self._select_worker(0) if images else None,
-                     "prefill":self._select_worker(1),"decode":self._select_worker(2)}
+            started = time.perf_counter()
             request = {"request_id":uuid.uuid4().hex,"sequence":self._sequence,
-                       "route":route,
+                       "started_s":started,
                        "new_tokens":new_tokens,"image_count":len(images),"image_digests":digests,
                        "context_digest":hashlib.sha256(json.dumps(digests).encode()).hexdigest()}
-            started = time.perf_counter()
-            deadline = time.monotonic()+self.request_timeout_s
+            if not images:
+                # 只保护共享 processor 的短 CPU 调用，不锁住后续模型执行。
+                inputs = prepare_inputs(self.spec,self.processor,normalized,[])
+                request["tokens"] = inputs["input_ids"][0].tolist()
+                self.spec.validate(request["tokens"],new_tokens)
+            state = _RequestState(request,time.monotonic()+self.request_timeout_s)
+            self._requests[request["request_id"]] = state
+            self._pending.append(request["request_id"])
+        finished = False
+        rejected = False
+        try:
+            route = self._wait_route(state)
             feature_digest = None
             if images:
                 # 先只唤醒 V，拿到处理器展开图像占位符后的完整 token 序列。
                 self.controls[route["vision"]].put({**request,"messages":normalized,"images":images})
-                try:
-                    event = self._event(deadline)
-                    if event.get("request_id")!=request["request_id"]:
-                        raise RuntimeError("vision preparation request identity mismatch")
-                    if event["type"] == "reject":
-                        raise ValueError(event["error"])
-                    if event["type"] != "vision_ready":
-                        raise RuntimeError("unexpected vision preparation event")
-                    request["tokens"] = event["tokens"]
-                    feature_digest = event["feature_digest"]
-                except ValueError:
-                    raise
-                except BaseException:
-                    self.close()
-                    raise
-            else:
-                inputs = prepare_inputs(self.spec,self.processor,normalized,[])
-                request["tokens"] = inputs["input_ids"][0].tolist()
-                self.spec.validate(request["tokens"],new_tokens)
+                event = self._request_event(state,state.deadline)
+                if event["type"] == "reject":
+                    rejected = True
+                    raise ValueError(event["error"])
+                if event["type"] != "vision_ready":
+                    raise RuntimeError("unexpected vision preparation event")
+                request["tokens"] = event["tokens"]
+                feature_digest = event["feature_digest"]
             # P/D 现在都知道同一份 tokens 和图片上下文，才能核对交接元数据。
             for rank in (route["prefill"],route["decode"]):
                 self.controls[rank].put(request)
             expected = ("vision_handoff","handoff","result") if images else ("handoff","result")
             # 主进程通过事件队列收 Token 和阶段完成消息；不亲自搬运特征/KV。
-            received = self.collect(request,deadline,on_token,expected)
+            received = self.collect(request,state.deadline,on_token,expected,
+                event_source=lambda deadline:self._request_event(state,deadline))
             result = {**received["result"],**received["handoff"],**received.get("vision_handoff",{})}
             result.pop("type")
+            result.pop("rank")  # 多阶段结果没有单一来源 rank；实际归属统一看 route。
             if result["prefill_feature_digest"] != feature_digest:
-                self.close()
                 raise RuntimeError("vision feature identity changed before prefill")
             times = result["token_ready_times_s"]
             result.update(mode="idefics3_three_stage",device=self.spec.devices[0],transport=self.spec.transport,
                 stage_devices=list(self.spec.devices),control_transport="gloo",
                 stage_pools=[list(pool) for pool in self.spec.pools],route=route,
                 verify_payload=self.spec.verify_payload,worker_info=self.worker_info,
+                pipeline_concurrent=True,queue_wait_ms=state.queue_wait_ms,max_inflight=self.max_inflight,
                 worker_pids=[p.pid for p in self.processes],image_count=len(images),
                 image_digests=digests,vision_bypassed=not images,
                 vision_ms=result.get("vision_ms",0),vision_transfer_ms=result.get("vision_transfer_ms",0),
@@ -656,4 +758,42 @@ class LocalVPD(LocalPD):
                 e2e_ms=(time.perf_counter()-started)*1000,backend_ttft_ms=(times[0]-started)*1000,
                 backend_tbt_ms=[(b-a)*1000 for a,b in zip(times,times[1:])],
                 scope=self.scope)
+            finished = True
             return result
+        except BaseException:
+            # 只有明确的 V 预处理拒绝或尚未获配路由的等待失败可以局部回收。
+            if "route" in request and not rejected:
+                self.close(error=RuntimeError("an active VPD request failed; restart runtime"))
+            raise
+        finally:
+            with self._condition:
+                if not self._closed:
+                    if finished:
+                        self._router.finish(request["request_id"])
+                    elif rejected:
+                        self._router.abandon(request["request_id"])
+                if request["request_id"] in self._pending:
+                    self._pending.remove(request["request_id"])
+                self._requests.pop(request["request_id"],None)
+                self._condition.notify_all()
+
+    def close(self,*,error=None):
+        """选出一个关闭者，先唤醒所有请求，再无锁等待泵和进程退出。"""
+        with self._condition:
+            owner = not self._closed
+            if owner:
+                self._closed = True
+                self._stop_error = error or RuntimeError("VPD runtime closed")
+                for state in self._requests.values():
+                    state.inbox.put(RuntimeError(str(self._stop_error)))
+                self._condition.notify_all()
+        if not owner:
+            if threading.current_thread() is not self._pump_thread:
+                self._stopped.wait()
+            return
+        try:
+            if self._pump_thread is not None and threading.current_thread() is not self._pump_thread:
+                self._pump_thread.join()
+            self._cleanup_processes()
+        finally:
+            self._stopped.set()

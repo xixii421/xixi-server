@@ -1,10 +1,11 @@
 """Paired, warmed HTTP ablation: full model / VPD / VPD with bounded feature reuse.
 
-Synthetic image-reuse workloads; closed-loop concurrency one. This does not
+Synthetic image-reuse workloads; bounded closed-loop HTTP concurrency. This does not
 claim production-trace coverage, cross-GPU scaling or causal gains from PD alone.
 """
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import hashlib
 import io
@@ -97,10 +98,13 @@ def main():
     parser.add_argument("--requests",type=int,default=20,help="per scenario/mode/round")
     parser.add_argument("--rounds",type=int,default=3)
     parser.add_argument("--new-tokens",type=int,default=8)
+    parser.add_argument("--concurrency",type=int,default=1,help="maximum simultaneous HTTP requests")
     add_runtime_arguments(parser,default_device="cuda:0")
     args=parser.parse_args()
     if args.requests<1 or args.rounds<1 or not 1<=args.new_tokens<=32:
         parser.error("invalid sample or generation count")
+    if not 1<=args.concurrency<=args.max_inflight:
+        parser.error("concurrency must be positive and no greater than max-inflight")
     placement=VModelSpec(device=args.device,transport=args.transport,**placement_kwargs(args))
     placement.check_hardware()
     args.output_dir.mkdir(parents=True,exist_ok=False)
@@ -121,10 +125,10 @@ def main():
                                verify_payload=not args.no_handoff_checksum,
                                vision_cache_bytes=16*1024*1024 if mode=="vpd_cached" else 0)
                 runtime=(MonolithicVLM(spec) if mode=="monolithic" else
-                         LocalVPD(spec,startup_timeout_s=180,request_timeout_s=60))
+                         LocalVPD(spec,startup_timeout_s=180,request_timeout_s=60,max_inflight=args.max_inflight))
                 hardware_before=environment()
                 with runtime:
-                    server=VPDHTTPServer(("127.0.0.1",0),runtime)
+                    server=VPDHTTPServer(("127.0.0.1",0),runtime,max_inflight=args.max_inflight)
                     thread=threading.Thread(target=server.serve_forever,daemon=True)
                     thread.start()
                     endpoint=f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
@@ -140,18 +144,18 @@ def main():
                             batch=[]
                             bodies=[payload(server.model_name,seeds_for(scenario,i),i,args.new_tokens)
                                     for i in range(args.requests)]
-                            cohort_started=time.perf_counter()
-                            for index in range(args.requests):
+                            # 请求体已提前构建；仅主线程写记录，避免日志写入或完成
+                            # 先后改变请求编号。executor.map 保持输入顺序，客户端
+                            # 最多同时维持 concurrency 个在途 HTTP 请求。
+                            with ThreadPoolExecutor(max_workers=args.concurrency) as clients:
+                                cohort_started=time.perf_counter()
+                                records=list(clients.map(lambda body:measure(endpoint,body,timeout_s=90),bodies))
+                                cohort_elapsed=time.perf_counter()-cohort_started
+                            for index,record in enumerate(records):
                                 seeds=seeds_for(scenario,index)
-                                record=measure(endpoint,bodies[index],timeout_s=90)
                                 item={"round":round_index,"mode":mode,"scenario":scenario,"index":index,
                                       "image_seeds":seeds,"prompt":QUESTIONS[index%len(QUESTIONS)],"record":record}
                                 batch.append(item)
-                                if record["status"]!="ok" or record["backend_metrics"] is None:
-                                    raw.write(json.dumps(item)+"\n")
-                                    raw.flush()
-                                    raise RuntimeError(f"measured request failed: {record}")
-                            cohort_elapsed=time.perf_counter()-cohort_started
                             for item in batch:
                                 item["cohort_id"]=f"{round_index}:{mode}:{scenario}"
                                 item["cohort_elapsed_s"]=cohort_elapsed
@@ -159,6 +163,12 @@ def main():
                             for item in batch:
                                 raw.write(json.dumps(item)+"\n")
                             raw.flush()
+                            failures=[item for item in batch if item["record"]["status"]!="ok"
+                                      or item["record"]["backend_metrics"] is None]
+                            if failures:
+                                # 并发时其他请求已经发生，失败也保留整组原始记录，
+                                # 不只留下最先检查到的失败而丢掉其他已完成请求。
+                                raise RuntimeError(f"{len(failures)} measured requests failed; see requests.jsonl")
                             block={"round":round_index,"mode":mode,"scenario":scenario,
                                    "cohort_elapsed_s":cohort_elapsed,"summary":aggregate(batch)}
                             blocks.append(block)
@@ -200,7 +210,9 @@ def main():
                 "resource_comparison":"monolithic uses one GPU; VPD uses the listed stage devices; no equal-GPU-budget scaling claim",
                 "dtype":"bfloat16","rounds":args.rounds,"requests_per_scenario_per_round":args.requests,
                 "new_tokens":args.new_tokens,"warmups_per_scenario":len(warm_seeds),
-                "concurrency":1,"mode_order":"rotating Latin order by round",
+                "concurrency":args.concurrency,"max_inflight":args.max_inflight,
+                "parallel_scope":"concurrent HTTP clients; VPD stage-slot pipeline; monolithic model execution remains serialized",
+                "mode_order":"rotating Latin order by round",
                 "load":"synthetic image reuse; two 64x64 seeded noise images per request",
                 "preprocessing":"same no-split 512-longest-edge processor in all layouts",
                 "clock_control":"not locked; no production-trace or linear-scaling claim",

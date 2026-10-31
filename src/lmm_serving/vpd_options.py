@@ -10,6 +10,8 @@ def add_placement_arguments(parser):
 
 
 def add_runtime_arguments(parser, *, default_device="cpu"):
+    parser.add_argument("--max-inflight",type=int,default=4,
+                        help="maximum admitted requests, including bounded route waiters")
     parser.add_argument("--device", default=default_device,
                         help="shared device for Gloo mode / reference device, e.g. cpu or cuda:0")
     add_placement_arguments(parser)

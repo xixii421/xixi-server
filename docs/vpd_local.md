@@ -107,8 +107,9 @@ with build_opener(ProxyHandler({})).open(request, timeout=60) as response:
 - P -> D 复用 KV 协议，额外绑定有序图片上下文摘要，避免相同文字、不同图片之间的缓存错配。
 - 接收端确认实际数据完整，CUDA 模式确认拷贝完成后才 ACK，发送端随后释放源特征或缓存。
 - 视觉预处理拒绝发生在数据传输前，后续合法请求仍可使用通道。
-- worker 退出、状态不明或输出消费者断开时，停止并回收三个进程，拒绝复用不确定通道。
-- 并发调用方按请求串行执行；SSE Token 根据索引重排后发送，不依赖不同进程消息到达顺序。
+- worker 退出、状态不明或输出消费者断开时，停止并回收所有 worker，唤醒全部在途请求。
+- 并发调用方按空闲 V/P/D 槽位路由，V/P 交接后可复用，D 保留到生成结束；默认接纳上限为 4。
+- 事件泵按请求 ID 和 rank 分发事件，各 SSE 流分别按索引重排，不依赖不同进程消息到达顺序。
 
 ## 验证
 
@@ -161,7 +162,8 @@ PYTHONPATH=src .venv-pd/bin/python -m lmm_serving.launcher vpd \
 
 当前支持图像特征插入语言序列的架构；不包括 Llama Vision 的 Cross-Attention 状态适配。
 原 ModServe 的 11B/26B 多卡 vLLM 路径保留，尚未迁移到这个三阶段后端。
-请求串行执行，没有 Continuous Batching、动态扩缩容或跨机调度。
+支持有界并发路由，单 worker 内顺序执行；路由提前预留 D，单 D 时只有一个活动路由。
+没有 Continuous Batching、动态扩缩容或跨机调度。
 字节上限只约束逻辑 payload，不代表模型、激活、CUDA context 和临时拷贝的总显存上限。
 
 当前证据支持“实现并验证三阶段多模态服务”；没有证据支持某个加速倍数或服务成本下降。

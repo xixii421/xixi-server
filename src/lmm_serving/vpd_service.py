@@ -9,7 +9,9 @@ from .vpd_options import add_runtime_arguments, placement_kwargs
 
 
 class VPDHTTPServer(PDHTTPServer):
-    def __init__(self,address,runtime,max_inflight=2):
+    def __init__(self,address,runtime,max_inflight=None):
+        if max_inflight is None:
+            max_inflight=getattr(runtime,"max_inflight",2)
         tokenizer = runtime.processor.tokenizer if runtime.processor else None
         super().__init__(address,runtime,tokenizer,max_inflight)
         self.model_name = Path(runtime.spec.model_path).name if runtime.spec.model_path else "tiny-idefics3"
@@ -28,7 +30,8 @@ def run(args):
                       device=args.device,dtype=args.dtype,vision_cache_bytes=args.vision_cache_mib*1024*1024,
                       **placement_kwargs(args),
                       transport=args.transport,verify_payload=not args.no_handoff_checksum)
-    with LocalVPD(spec,startup_timeout_s=args.startup_timeout,request_timeout_s=args.request_timeout) as runtime:
+    with LocalVPD(spec,max_inflight=args.max_inflight,
+                  startup_timeout_s=args.startup_timeout,request_timeout_s=args.request_timeout) as runtime:
         server = VPDHTTPServer(("127.0.0.1",args.port),runtime)
         print(json.dumps({"url":f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
                           "model":server.model_name,"device":spec.devices[0],"worker_pids":

@@ -62,7 +62,7 @@ def main():
         references.append(reference_generate(reference_spec,make_messages(case),args.new_tokens))
         print(json.dumps({"reference_ready":case}),flush=True)
     cases=[]
-    with LocalVPD(spec,startup_timeout_s=180,request_timeout_s=60) as runtime:
+    with LocalVPD(spec,startup_timeout_s=180,request_timeout_s=60,max_inflight=args.max_inflight) as runtime:
         for case,reference in zip(colors,references):
             result=runtime.run(make_messages(case),args.new_tokens)
             passed=result["token_ids"]==reference
