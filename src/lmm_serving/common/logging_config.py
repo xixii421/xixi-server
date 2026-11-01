@@ -1,4 +1,4 @@
-# Shared logging setup for lmm-serving.
+# Shared logging setup for xixi-server.
 
 import logging
 import os
@@ -38,7 +38,7 @@ def _use_color():
 
 
 def get_logger(name):
-    # Return a logger with the shared lmm-serving format.
+    # Return a logger with the shared xixi-server format.
     global _configured
     if not _configured:
         requested = os.environ.get("LMM_LOG_LEVEL", "INFO").upper()

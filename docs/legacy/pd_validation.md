@@ -1,10 +1,10 @@
-# PD 扩展：当前实现状态与验收
+# 早期 PD 扩展与流式工具验证（2026-10-30）
 
 实际 WSL 工作分支：`codex/pd-local`。基线提交：
 `9c78f7bf3df65ebe4f47d8cb3819228c5b601ecc`。
 
 本机新增的文本 PD 参考后端已完成并验证，使用与结果见 [本机 PD 说明](pd_local.md)。
-真实 SmolVLM 三阶段服务也已完成并在单卡验证，见 [V/P/D 服务](vpd_local.md)。
+真实 SmolVLM 三阶段服务也已完成并在单卡验证，见 [V/P/D 服务](../vpd_local.md)。
 下面的待完成项专指原 ModServe 多模态 vLLM 生产路径。
 
 ## 2026-10-30 本机验证记录

@@ -1,22 +1,20 @@
 # 本机视觉 / Prefill / Decode 三阶段服务
 
-新增三卡设备映射和 NCCL 数据通道见 [三卡实现与验收](vpd_multigpu.md)。
-本文以下保留本机单卡/Gloo 用法和既有实验条件，三卡结果需另行真实硬件验收。
+多卡设备池和 NCCL 数据通道见 [多卡部署与验收](vpd_multigpu.md)。
+本文介绍单卡/Gloo 用法；当前已完成的真实四卡结果见 [四卡报告](validation/four-gpu-20261101.md)。
 
-代码：WSL `/home/xixii/project/ModServe-SingleGPU`，分支 `codex/pd-local`。
 本机实际使用 [SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct)
 预训练视觉语言模型，三个独立进程完成完整图像到文本生成，不以模拟视觉特征替代编码。
 
 ## 启动
 
-模型已下载至 `/home/xixii/huggingface/SmolVLM-256M-Instruct`。
-CUDA 环境 `.venv-pd-cuda` 已准备好，使用 Python 3.10、PyTorch 2.6.0+cu124、
-Transformers 4.51.3、Pillow 11.1.0。
+按 [安装说明](../README.md#快速开始) 创建 `.venv-vpd`，准备本地模型目录。
+已验证的 CUDA 环境为 Python 3.10、PyTorch 2.6.0+cu124、Transformers 4.51.3、Pillow 11.1.0。
 
 ```bash
-cd /home/xixii/project/ModServe-SingleGPU
-PYTHONPATH=src .venv-pd-cuda/bin/python -m lmm_serving.launcher vpd \
-  --model /home/xixii/huggingface/SmolVLM-256M-Instruct \
+cd xixi-server
+PYTHONPATH=src .venv-vpd/bin/python -m lmm_serving.launcher vpd \
+  --model /path/to/SmolVLM-256M-Instruct \
   --device cuda:0 --port 8099
 ```
 
@@ -66,14 +64,14 @@ with build_opener(ProxyHandler({})).open(request, timeout=60) as response:
 
 在 content 中按顺序加入多个 image_url 即为多图请求；纯文本可用字符串 content。
 当前最多 2 张图、每图 2MiB、每图 1,048,576 像素，HTTP body 最多 8MiB。
-超额请求返回 413；已接纳请求达到 2 个时返回 429。
+超额请求返回 413；默认已接纳请求达到 4 个时返回 429，可用 `--max-inflight` 调整。
 只支持 greedy、n=1、最多 32 个新 Token。固定长度生成，尚未按 EOS 提前结束。
 
 默认启用 16MiB CPU 视觉特征 LRU，可用 `--vision-cache-mib 0` 关闭。
 缓存按图片内容和模型/预处理命名空间寻址，支持同图不同问题、部分命中和多图换序。
 命中跳过视觉编码，仍执行图像预处理、P/D 和必要的传输。
 `stream_options.include_backend_metrics=true` 可在最终 SSE 元数据中返回命中、编码图数和阶段耗时。
-正式实验与简历文案见 [消融报告](vpd_benchmark.md)、[项目文案](resume_project2.md)。
+当前实验见 [四卡报告](validation/four-gpu-20261101.md)，旧版本结果见 [历史单卡消融](vpd_benchmark.md)。
 
 ## 三阶段如何交接
 
@@ -117,8 +115,8 @@ with build_opener(ProxyHandler({})).open(request, timeout=60) as response:
 它自动创建纯色图片作为可复现输入，不需要用户提供照片。
 
 ```bash
-PYTHONPATH=src .venv-pd-cuda/bin/python utils/validate_vpd_model.py \
-  --model /home/xixii/huggingface/SmolVLM-256M-Instruct --device cuda:0 \
+PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_model.py \
+  --model /path/to/SmolVLM-256M-Instruct --device cuda:0 \
   --new-tokens 8 --output metrics/my-vpd-verification.json
 ```
 
@@ -127,8 +125,8 @@ PYTHONPATH=src .venv-pd-cuda/bin/python utils/validate_vpd_model.py \
 无需下载权重的测试使用真实随机微型 Idefics3（真实视觉与语言计算，并非 mock）：
 
 ```bash
-PYTHONPATH=src .venv-pd/bin/python tests/test_vpd.py
-PYTHONPATH=src .venv-pd/bin/python -m lmm_serving.launcher vpd \
+PYTHONPATH=src .venv-cpu/bin/python tests/test_vpd.py
+PYTHONPATH=src .venv-cpu/bin/python -m lmm_serving.launcher vpd \
   --dtype float32 --port 8099
 ```
 
@@ -158,7 +156,7 @@ PYTHONPATH=src .venv-pd/bin/python -m lmm_serving.launcher vpd \
 这是可运行的本机三阶段服务，当前后端是 Transformers + Idefics3/SmolVLM。
 本页的单卡/Gloo 配置让三个进程共享一张 GPU；特征和 KV 经 CPU/Gloo 交接。
 当前另有独立设备映射和 NCCL 路径，见 [架构设计](architecture.md) 与 [三卡验收](vpd_multigpu.md)。
-三卡真实验收和效果仍待补充，不宣称 CUDA IPC、零拷贝或独立资源池扩容收益。
+真实四卡功能验收与固定拓扑并发基准已经完成；NCCL 使用 SHM，不宣称 CUDA IPC、零拷贝或等预算扩容收益。
 
 当前支持图像特征插入语言序列的架构；不包括 Llama Vision 的 Cross-Attention 状态适配。
 原 ModServe 的 11B/26B 多卡 vLLM 路径保留，尚未迁移到这个三阶段后端。
@@ -166,7 +164,5 @@ PYTHONPATH=src .venv-pd/bin/python -m lmm_serving.launcher vpd \
 没有 Continuous Batching、动态扩缩容或跨机调度。
 字节上限只约束逻辑 payload，不代表模型、激活、CUDA context 和临时拷贝的总显存上限。
 
-当前证据支持“实现并验证三阶段多模态服务”；没有证据支持某个加速倍数或服务成本下降。
-
-此处讨论单卡功能验证；历史缓存消融另有独立条件和结果。本轮整理后的测试与改动见
-[代码复查](code_review.md)，实测效果以新记录填写。
+本页单卡用法用于功能验证，当前四卡性能按 [报告](validation/four-gpu-20261101.md) 的条件单独引用。
+实现修正与回归范围见 [实现记录](validation/implementation-notes.md)。

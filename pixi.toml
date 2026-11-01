@@ -1,6 +1,6 @@
-# Pixi workspace for lmm-serving — the build system (see README; `pixi run setup`).
+# xixi-server 的上游 vLLM 环境；SmolVLM 主线使用 README 中的独立环境。
 [workspace]
-name = "lmm-serving"
+name = "xixi-server"
 channels = ["conda-forge"]
 platforms = [{ platform = "linux-64", cuda = "12.4" }]
 
@@ -17,7 +17,7 @@ lsof = "*"
 numactl = "*"
 
 [pypi-dependencies]
-lmm-serving = { path = ".", editable = true }
+xixi-server = { path = ".", editable = true }
 datasets = "==3.2.0"
 # transformers 4.48.x and tokenizers require huggingface-hub <1.0,>=0.24.0; unpinned it
 # resolves to 1.x and breaks vLLM/transformers at import. Pin to a known-good 0.27.x.

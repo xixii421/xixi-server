@@ -3208,7 +3208,7 @@ packages:
   size: 29196
   timestamp: 1749219684767
 - pypi: ./
-  name: lmm-serving
+  name: xixi-server
   requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/02/ad/0b9cc9f38a7324a7eb1d80f834eaa5283d17e9271bbda3186e598dddaeac/yarl-1.24.2-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
   name: yarl

@@ -1,0 +1,47 @@
+{
+  "date": "2026-11-01",
+  "base_commit": "3ae09e16629a65c67cd4308e21f49d00ca951a32",
+  "working_tree_modified": true,
+  "scope": "Public documentation, project metadata and repository cleanup; CPU regression only, no GPU or performance revalidation",
+  "environment": {
+    "python": "3.10.12",
+    "torch": "2.5.1+cpu",
+    "transformers": "4.51.3",
+    "cuda_available": false
+  },
+  "regression": {
+    "tests_passed": 105,
+    "script_checks_passed": 41,
+    "gpu_tests_skipped": 4,
+    "all_suites_passed": true,
+    "suites": [
+      "vpd_router",
+      "vpd_parallel",
+      "vpd_transport",
+      "vpd",
+      "vpd_pools",
+      "vpd_tools",
+      "vision_cache",
+      "pd_local",
+      "pd_service",
+      "stream_benchmark",
+      "launcher"
+    ],
+    "local_report": "metrics/public-cleanup-20261101-002/report.json"
+  },
+  "initial_attempt": {
+    "passed": false,
+    "reason": "Sandbox prevented localhost Gloo/HTTP communication; rerun passed with localhost access",
+    "local_report": "metrics/public-cleanup-20261101-001/report.json"
+  },
+  "legacy_summary": {
+    "audited_raw_requests": 540,
+    "resume_files_generated": false,
+    "local_output": "metrics/public-cleanup-summary-20261101-001/"
+  },
+  "github_actions": "CPU workflow added; not yet executed on GitHub",
+  "limitations": [
+    "Skipped GPU cases are not counted as passed",
+    "Original experiment logs remain local; historical performance evidence is unchanged"
+  ]
+}

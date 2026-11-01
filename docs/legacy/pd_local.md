@@ -1,11 +1,10 @@
 # 本机 Qwen3 PD：使用与验证
 
-代码位于 WSL `/home/xixii/project/ModServe-SingleGPU`，分支 `codex/pd-local`。
-原版 `/home/xixii/project/ModServe` 保留为对照。
+这是早期文本 PD 参考路径；当前项目主线见 [SmolVLM V/P/D](../vpd_local.md)。
 
 这是新增的 Transformers 文本 PD 参考后端：Prefill、Decode 在两个独立进程中执行，
 通过真实 Gloo 传递 KV。已使用本地 Qwen3-0.6B 权重验证 CPU 与 RTX 4060 Laptop 单卡回环。
-它尚未接入原 ModServe 的多模态 vLLM 服务，不代表视觉/P/D 三阶段已经完成。
+它尚未接入原 ModServe 的多模态 vLLM 服务，与当前视觉/P/D 三阶段后端分别验证。
 
 ## 数据路径
 
@@ -32,12 +31,11 @@ CPU 路径使用 BF16 或 FP32 CPU 张量。
 - 当前固定长度 greedy，生成到指定 Token 数，暂不按 EOS 提前结束。
 - 服务只接受文本消息；图片、多模态内容和未支持的参数明确拒绝。
 
-## 已准备好的环境
+## 环境
 
 CPU 环境 `.venv-pd`：Python 3.10、PyTorch 2.5.1+cpu、Transformers 4.51.3。
 CUDA 环境 `.venv-pd-cuda`：Python 3.10、PyTorch 2.6.0+cu124、Transformers 4.51.3。
-模型目录 `/home/xixii/huggingface/Qwen3-0.6B`，加载设置 `local_files_only=True`。
-原有 `.venv` 没有修改。
+模型目录 `/path/to/Qwen3-0.6B`，加载设置 `local_files_only=True`。
 
 重新创建 CPU 环境：
 
@@ -61,7 +59,7 @@ uv pip install --python .venv-pd-cuda/bin/python \
 从实际 WSL 项目目录运行。输出文件存在时会拒绝覆盖，请为新实验换文件名。
 
 ```bash
-cd /home/xixii/project/ModServe-SingleGPU
+cd xixi-server
 
 # 无模型下载，真实随机微型 Qwen3 的双进程验证。
 PYTHONPATH=src .venv-pd/bin/python -m lmm_serving.pd_local \
@@ -69,12 +67,12 @@ PYTHONPATH=src .venv-pd/bin/python -m lmm_serving.pd_local \
 
 # 真实 Qwen3 权重与未拆分模型对照；改为 cpu 可用 CPU 环境运行。
 PYTHONPATH=src .venv-pd-cuda/bin/python -m lmm_serving.pd_local \
-  --model /home/xixii/huggingface/Qwen3-0.6B --device cuda:0 \
+  --model /path/to/Qwen3-0.6B --device cuda:0 \
   --verify --new-tokens 8 --output metrics/my-qwen3-pd.json
 
 # 自动启动临时 HTTP 服务，验证聊天模板、非流式输出和 SSE 文本均与参考结果一致。
 PYTHONPATH=src .venv-pd-cuda/bin/python utils/validate_pd_model.py \
-  --model /home/xixii/huggingface/Qwen3-0.6B --device cuda:0 \
+  --model /path/to/Qwen3-0.6B --device cuda:0 \
   --new-tokens 8 --output metrics/my-qwen3-http.json
 ```
 
@@ -86,7 +84,7 @@ PYTHONPATH=src .venv-pd-cuda/bin/python utils/validate_pd_model.py \
 
 ```bash
 PYTHONPATH=src .venv-pd-cuda/bin/python -m lmm_serving.pd_service \
-  --model /home/xixii/huggingface/Qwen3-0.6B --device cuda:0 --port 8099
+  --model /path/to/Qwen3-0.6B --device cuda:0 --port 8099
 ```
 
 服务只监听 `127.0.0.1`。`GET /health` 返回 worker 状态。
@@ -117,7 +115,7 @@ PYTHONPATH=src .venv-pd-cuda/bin/python -m lmm_serving.pd_service \
 
 ## 已有的多模态三阶段入口
 
-现已新增真实 SmolVLM/Idefics3 的 V/P/D 三阶段服务，见 [三阶段使用说明](vpd_local.md)。
+现已新增真实 SmolVLM/Idefics3 的 V/P/D 三阶段服务，见 [三阶段使用说明](../vpd_local.md)。
 其中视觉特征与 KV 均由真实模型生成并在独立进程间交接，纯文本跳过视觉。
 
 原 vLLM 的 Paged KV 与 Cross-Attention 状态尚未迁移；

@@ -1,6 +1,8 @@
-# 三阶段视觉特征复用：正式实验与边界
+# 历史单卡视觉特征复用实验（2026-10-31）
 
-原始实验目录：`/home/xixii/project/ModServe-SingleGPU/metrics/vpd-benchmark-direct-20261031`。本文由原始 JSONL 校验后生成，没有过滤异常慢请求。
+本文保留旧版单卡条件，不能移用为当前四卡结果。当前结论见 [四卡报告](validation/four-gpu-20261101.md)。
+
+原始实验目录（仅保存在实验机）：`metrics/vpd-benchmark-direct-20261031`。本文由原始 JSONL 校验后生成，没有过滤异常慢请求。
 
 ## 方法
 
@@ -58,6 +60,6 @@
 
 ```bash
 PYTHONPATH=src .venv-pd-cuda/bin/python utils/benchmark_vpd.py \
-  --model /home/xixii/huggingface/SmolVLM-256M-Instruct --device cuda:0 \
+  --model /path/to/SmolVLM-256M-Instruct --device cuda:0 \
   --requests 20 --rounds 3 --new-tokens 8 --output-dir metrics/new-vpd-benchmark
 ```

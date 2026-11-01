@@ -1,4 +1,4 @@
-"""Audit raw experiment records, then derive a report and honest resume wording."""
+"""Audit historical single-GPU loopback records and derive a benchmark report."""
 import argparse
 from collections import defaultdict
 import json
@@ -55,11 +55,11 @@ def audit(folder):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results",type=Path,required=True)
-    parser.add_argument("--docs",type=Path,required=True)
+    parser.add_argument("--docs",type=Path,required=True,help="new output directory; never overwrites project docs")
     args=parser.parse_args()
     report,records=audit(args.results)
     config=report["configuration"]
-    args.docs.mkdir(parents=True,exist_ok=True)
+    args.docs.mkdir(parents=True,exist_ok=False)
     rows=[]
     for scenario in SCENARIOS:
         for mode in MODES:
@@ -126,46 +126,13 @@ def main():
 
 ```bash
 PYTHONPATH=src .venv-pd-cuda/bin/python utils/benchmark_vpd.py \\
-  --model /home/xixii/huggingface/SmolVLM-256M-Instruct --device cuda:0 \\
+  --model /path/to/SmolVLM-256M-Instruct --device cuda:0 \\
   --requests 20 --rounds 3 --new-tokens 8 --output-dir metrics/new-vpd-benchmark
 ```
 """
     (args.docs/"vpd_benchmark.md").write_text(text,encoding="utf-8")
     stable=hot_gain>0 and all(value>0 for value in rounds)
-    performance=(f"在 RTX 4060 Laptop 8GB、SmolVLM-256M BF16、并发 1、双图/8 输出 Token 的重复图片合成负载下，"
-        f"客户端 TTFT 中位数由 {before['client_ttft_p50_ms']:.1f} 降至 {after['client_ttft_p50_ms']:.1f} ms"
-        f"（降低 {hot_gain:.1f}%，视觉缓存命中率 {after['image_hit_rate']*100:.0f}%）；"
-        f"每配置 3 轮、每轮 20 请求，轮换配置顺序，独立报告冷图与混合负载。"
-        if stable else "完成单体、三阶段无缓存与缓存模式的三轮对照实验，记录命中、未命中和混合负载的收益与开销；未将不稳定指标写成确定加速结论。")
-    resume=f"""# 项目 2：可替换简历文案
-
-**xixi-server｜多模态三阶段推理服务与视觉特征复用优化**　2026.06—至今
-
-基于 ModServe 开源仓库的工程扩展；本机后端采用 PyTorch / Transformers / SmolVLM / Gloo / HTTP-SSE。
-
-- **三阶段服务：**将视觉编码与投影、Prefill、Decode 拆为独立进程，按阶段裁剪模型权重；支持单图、多图和纯文本绕过视觉，通过 Gloo 交接 BF16 视觉特征与 KV Cache。
-- **缓存与资源管理：**实现内容寻址、模型/预处理隔离的视觉特征复用与字节级 LRU，处理部分命中、多图重排和重复图片；以请求 ID、序号、摘要校验及接收确认管理在途状态，支持容量拒绝和故障后的进程组回收。
-- **性能验证：**{performance}
-- **正确性与工程化：**构建真实模型、三进程传输、HTTP/SSE、取消与故障回归；正式实验中 {len(records)*2//3} 条三阶段请求逐 Token 对齐持久单体基线，保存逐请求数据、运行配置及复现脚本。
-
-## 一页简历空间紧张时
-
-- 在 ModServe 派生项目中实现视觉/P/D 三进程服务，按阶段裁剪真实多模态模型权重，支持单图、多图与流式生成；以 UUID、上下文摘要和 ACK 管理特征/KV 交接及异常回收。
-- 实现内容寻址、16MiB 字节级 LRU 的视觉特征复用，支持部分命中与多图重排；在 4060 8GB / SmolVLM-256M BF16 / 并发 1 / 双图 8 输出 Token 的重复图片合成负载下，100% 命中时 TTFT 中位数由 {before['client_ttft_p50_ms']:.1f} 降至 {after['client_ttft_p50_ms']:.1f} ms（降低 {hot_gain:.1f}%）。
-- 进行单体/三阶段无缓存/有缓存的三轮对照，每配置每场景 60 请求；{len(records)*2//3} 条三阶段请求逐 Token 对齐单体，保留冷图代价、原始日志与复现脚本。
-
-详细测试数量与冷热图对照放仓库 README。不要删除指标的实验条件和“重复图片合成负载”。
-
-## 事实边界
-
-- ModServe 的原始架构和论文结果归原作者；这里写的是派生仓库的新后端、缓存与验证。
-- 当前是单卡主机内存/Gloo 回环，不写成跨 GPU NCCL、CUDA IPC 或零拷贝优化。
-- 当前模型采用视觉特征插入语言序列，不宣称已适配 Cross-Attention 状态交接。
-- 不写超过 vLLM、生产 P99 SLO、动态批处理或服务成本降低。
-- “2026.06”沿用原简历项目起始月；正式投递时请与实际开始时间核对。
-"""
-    (args.docs/"resume_project2.md").write_text(resume,encoding="utf-8")
-    print(json.dumps({"audited_requests":len(records),"resume_metric_stable":stable,
+    print(json.dumps({"audited_requests":len(records),"hot_ttft_reduction_consistent":stable,
                       "hot_ttft_reduction_pct":hot_gain,"output_docs":str(args.docs)},indent=2))
 
 

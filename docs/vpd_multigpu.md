@@ -167,7 +167,7 @@ PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_multigpu.py \
 首 Token 在 Prefill 完成时即可发送，因此 KV 通信的影响还需要看首/第二 Token 间隔、后续 TBT
 和 E2E，不能只看 TTFT。小模型三卡可能更慢，实测后据实记录。
 
-## 本机回归与简历边界
+## 回归与验证范围
 
 ```bash
 PYTHONPATH=src .venv-pd-cuda/bin/python utils/run_regressions.py \
@@ -177,8 +177,8 @@ PYTHONPATH=src .venv-pd-cuda/bin/python utils/run_regressions.py \
 
 本机单 GPU 可以验证 NCCL 组初始化、CUDA 张量准备、校验和同步 API，不能验证跨卡 P2P。
 三卡用例默认跳过，报告区分发现数量、执行数量和跳过数量。
-真实三卡验收以前，可表述“实现三阶段设备映射、NCCL 张量交接和三卡验收工具”；
-不能写“已完成三卡验证”或编写未经实测的多卡性能数字。
+真实四卡验收和当前性能以 [四卡报告](validation/four-gpu-20261101.md) 为准，
+本机控制面测试与多卡模型验收分别记录。
 
 上一轮三卡版本的本机验证记录：67 项单元/集成测试与 41 项启动器脚本检查通过；
 其中新增通信套件实际执行 12 项，包含单卡真实 NCCL API 测试，另有 2 项三卡测试跳过。
@@ -186,9 +186,9 @@ PYTHONPATH=src .venv-pd-cuda/bin/python utils/run_regressions.py \
 CPU 与单卡 Gloo 传输探针通过，基准脚本冒烟的 18 条测量请求输出对齐。
 三卡验收入口在单卡硬件上按预期拒绝启动，没有把它计为三卡验收成功。
 见 [上一轮验证汇总](validation/three-gpu-implementation-20261031.json)。
-冒烟运行只有一轮、每场景两请求，用于验证脚本，不能替换此前正式简历性能实验。
+这次历史冒烟只有一轮、每场景两请求，用于验证脚本，不能替换正式性能实验。
 
-本轮架构整理与修复另见 [代码复查](code_review.md)，新验证记录保存在
+本轮架构整理与修复另见 [实现记录](validation/implementation-notes.md)，新验证记录保存在
 `metrics/vpd-architecture-review-20261031/`。配置/在线签名采用启动快照，
 HTTP 只准备一次输入；探针在销毁通信组并确认正常退出后才报告通过。
 公开测试摘要见 [本轮验证汇总](validation/architecture-review-20261031.json)，完整日志保存在运行机器的 metrics 目录。

@@ -1,57 +1,53 @@
-# 项目目录说明
+# 目录与代码导航
 
-项目有两条运行路径：`modserve` 是视觉编码与文本生成分离的原版主线；`learning` 是无需模型和 GPU 的 CPU/Gloo 学习模式。`monolith` 提供完整模型一起运行的对照基线。
+项目名称为 xixi-server，Python 包路径保留 `src/lmm_serving/`。当前主线是 SmolVLM V/P/D 三阶段服务。
 
 ## 根目录
 
-| 目录 | 用途 |
+| 路径 | 职责 |
 |---|---|
-| `src/lmm_serving/` | 项目 Python 源码，见下表 |
-| `configs/` | 实例部署拓扑；`modserve/`、`monolith/` 是多 GPU YAML，`single_gpu_mock/` 是学习模式 JSON |
-| `client/` | 按 Azure 请求 trace 的时间顺序向服务发送请求，产生实验负载 |
-| `llm-backend/` | 固定版本 vLLM 的构建脚本和源码补丁；实现外部视觉特征接入与模型内部测量 |
-| `profiles/` | 各模型的编码、后端容量参考数据；自动扩缩容会读取。当前为上游参考值，不能当成本机实测 |
-| `traces/` | 小型请求回放样本；`experiment_traces/` 保存调整请求速率后的输入 |
-| `tests/` | 拓扑、调度、扩缩容、profiler、生产传输/背压和学习模式测试 |
-| `utils/` | 环境安装、远程部署、图片准备、trace 下载/转换、指标合并、实验进程清理等脚本 |
-| `docs/` | 配置、部署、实验、可靠传输改造、学习模式及验证记录 |
-| `.venv/` | 当前机器的 Python 环境，包含 CPU PyTorch 和测试依赖；不是源码，不提交 Git |
-| `.git/` | Git 提交历史、分支及工作区索引，保留以管理和恢复项目 |
+| `src/lmm_serving/` | 服务、模型阶段、路由和传输协议 |
+| `tests/` | 模型对齐、通信、设备池、背压、SSE、进程回收及保留路径的回归 |
+| `utils/` | 验收、基准、传输探针、回归运行器及上游部署工具 |
+| `docs/` | 架构、接口、部署、验证报告；`upstream/` 与 `legacy/` 单独保存参考路径 |
+| `configs/` | 上游 ModServe/Monolith 拓扑和 CPU 模拟模式配置 |
+| `llm-backend/` | 上游固定版本 vLLM 的构建脚本与补丁 |
+| `client/`、`traces/` | 上游轨迹回放客户端与小型输入样本 |
+| `profiles/` | 上游容量参考数据，不能作为本后端实测 |
+| `requirements-vpd-cuda.txt` | 当前 CUDA 主线的已验证依赖 |
+| `requirements-pd-local.txt` | 随机微型模型、PD/VPD 正确性测试的 CPU 依赖 |
+| `requirements-learning.txt` | 早期 CPU 模拟链路依赖 |
+| `requirements.txt`、`pixi.toml`、`pixi.lock` | 保留的上游环境，与当前主线分开 |
+| `pyproject.toml` | `xixi-server` 发行包元数据，兼容原 Pixi editable 安装 |
+| `LICENSE` | 保留的上游 MIT 许可证 |
+| `AGENTS.md` | 面向开发工具的项目约定和验证入口 |
 
-当前执行环境还提供空的只读 `.agents/`、`.codex/`、`.aws/` 目录；它们不是业务代码，也不属于项目跟踪文件。
+## 主线阅读顺序
 
-## 源码子目录
-
-| `src/lmm_serving/` 下的目录 | 用途 |
+| 文件 | 内容 |
 |---|---|
-| `modserve/` | 分离式多模态服务主线；`pipeline.py` 负责编码前预留、并发编码、实际大小校正及清理；`components/` 运行 Cluster、Image、Text 和 NCCL 接收服务 |
-| `monolith/` | 单体对照架构；`components/` 启动完整视觉语言模型实例及前端路由 |
-| `common/` | 共用基础模块：路由、指标、视觉 token 计算、自动扩缩容、Text 代理；新增的 `resources.py`、`features.py`、`admission.py`、`tensor_transfer.py` 实现生产预算和传输协议 |
-| `launcher/` | 命令行、拓扑校验、GPU/rank 分配、本机/SSH 进程启动和退出 |
-| `config/` | 全局模型、目录、端口、显存预算等运行参数，以及 Python / shell 加载器；与根目录的部署拓扑 `configs/` 分开 |
-| `profiler/` | 测量编码和后端耗时、拟合容量模型，生成 `profiles/` 中的容量文件 |
-| `learning/` | 独立 CPU/Gloo 学习链路：模拟编码/生成，真实进程间张量传输 |
+| `vpd_service.py`、`vpd_options.py` | HTTP 适配、启动选项与接纳配置 |
+| `vpd_local.py` | 输入准备、模型阶段、worker 执行与请求编排 |
+| `vpd_router.py` | 空闲副本选择、整条路由预留、阶段槽位释放 |
+| `vpd_transport.py` | 视觉/KV 布局、张量通道、接收检查和 ACK |
+| `vision_cache.py` | CPU 字节级 LRU 与独立副本管理 |
+| `pd_local.py`、`pd_service.py` | 共享进程/HTTP 基础设施及早期文本 PD 后端 |
+| `monolithic_local.py` | 持久单体模型对照，使用相同输入准备和生成策略 |
+| `stream_benchmark.py` | HTTP/SSE 逐请求测量与结果记录 |
 
-## 根目录文件
+模块均位于 `src/lmm_serving/`。先看 [架构时序](architecture.md)，再沿交接边界阅读实现。
 
-- `README.md`：项目入口、安装和运行命令。
-- `pyproject.toml`：Python 包的元数据、源码布局和打包配置。
-- `requirements.txt`：原版服务的 Python 依赖；vLLM 由补丁构建脚本另行安装。
-- `requirements-learning.txt`：CPU 学习模式的轻量依赖。
-- `pixi.toml` / `pixi.lock`：原版 CUDA/Python 环境、任务定义和依赖锁定。
-- `SINGLE_GPU_PLAN.md`：单卡适配计划及阶段状态，真实单卡推理尚未完成。
-- `.gitignore`：排除虚拟环境、模型下载、生成结果和缓存。
+## 保留路径
 
-## 可以重新生成的目录
+`modserve/`、`monolith/`、`profiler/` 为原版服务及其派生修改，依赖打补丁的 vLLM；
+`common/` 包含这些路径的共享调度、传输预算和扩缩容逻辑。
+`launcher/` 同时支持原版、早期文本 PD 与当前 VPD 入口。
+`learning/` 是 CPU/Gloo 模拟链路，保留源码和回归测试，其输出不属于真实模型性能证据。
+来源、部署和范围见 [上游说明](upstream/README.md)。
 
-以下内容不是需要保留的业务源码，清理后相应命令会重新创建：
+## 本地文件
 
-- `src/**/__pycache__/`、`tests/__pycache__/`：Python 字节码缓存。
-- `metrics/`、`logs/`：实验/演示输出；清理前按需保留自己的实验记录。
-- `llm-backend/vllm/`：构建脚本下载并应用补丁的 vLLM 源码。若它已经被 editable 安装，删除会破坏该安装，不能当作普通缓存直接删。
-
-本次清理删除了空的 `online_serving/`、Python 缓存及仅用于补丁验证、尚未安装的 vLLM 下载副本，保留了 `llm-backend/build_vllm.sh` 和 `vllm-lmm-serving.patch`。
-
-论文消融/评分代码 `src/lmm_serving/experiments/`、绘图目录 `notebooks/` 和静态演示目录 `examples/` 已删除。学习模式的 `--demo` 和测试改为在临时目录生成图片，结束后自动清理；常驻学习服务通过 `--image-dir` 指定自己的图片目录（默认为仓库根目录下的 `images/`）。保留请求回放、性能采样及测试，便于验证服务行为。
-
-阅读原版主线可按 `launcher/ → modserve/pipeline.py → modserve/components/ → common/ → vLLM 补丁` 的顺序进行。
+`.venv*/`、`metrics/`、`.local/`、模型下载和编辑器配置由 `.gitignore` 排除。
+个人笔记放 `.local/notes/`，私人完整简历保持本地且不跟踪。
+实验原始数据和已安装环境继续保留；它们不能当作普通缓存删除。
+`__pycache__/` 等可重新生成的缓存不属于公开项目内容。

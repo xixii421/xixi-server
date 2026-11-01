@@ -1,4 +1,4 @@
-# lmm-serving configuration
+# xixi-server: retained upstream service configuration
 
 IMAGE_DIR: ${HOME}/hf_cache/sharegpt_images
 HF_HOME: ${HOME}/hf_cache
