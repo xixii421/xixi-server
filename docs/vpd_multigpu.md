@@ -2,7 +2,10 @@
 
 当前代码按 V/P/D 三个非空设备池启动副本，每个设备对应一个 spawn 工作进程。
 旧三卡配置仍兼容；四卡推荐 1V+1P+2D，也可配置更多副本和不同设备编号。
-本机只有 RTX 4060 Laptop 一张卡；多卡 NCCL 点对点交接尚未获得真实硬件验收结果。
+本机只有 RTX 4060 Laptop 一张卡；2026-11-01 已在租用的 4×RTX4090 拓扑 A 上完成四卡 NCCL 交接验收，
+另在固定拓扑 B 上完成 NCCL 并发 1/2/4、Gloo 并发 2 正式基准，见 [四卡记录](validation/four-gpu-20261101.md)。
+修复版本共 3420 条测量请求、2280 条 VPD 请求逐 Token 对齐。CUDA peer access 均为 false，
+调试通道为 SHM，不能把 NCCL 交接称为直接 GPU P2P。
 本机通过的测试与待多卡验收的项目必须分别记录，不能把跳过用例算作通过。
 
 ## 部署与依赖
@@ -14,6 +17,9 @@
 python3.10 -m venv .venv-vpd
 .venv-vpd/bin/python -m pip install -r requirements-vpd-cuda.txt
 ```
+
+容器还须检查共享内存：本轮 10GiB `/dev/shm` 下通过，平台重启后 64MiB 下 NCCL 创建共享段失败。
+开关机后重新核对共享内存及物理 GPU/NUMA 拓扑，不能把不同拓扑的并发结果合并计算加速比。
 
 GPU 数量指同一台服务器的可见卡数。代码支持阶段副本池和有界并发路由，暂不支持多机、TP、连续批处理和动态扩缩容。
 P/D 分别持有语言模型权重，V 只把视觉模型和 Connector 放到自己的 GPU。

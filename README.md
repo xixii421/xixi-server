@@ -25,6 +25,10 @@ HTTP / SSE ── 主进程：请求入口、调度、Token 输出
 
 以下命令在仓库根目录执行，目标环境为 Linux/WSL、Python 3.10。准备本地 [SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) 目录，包含权重、模型配置和 processor/tokenizer 文件。
 
+容器内启动 NCCL 前检查 `/dev/shm`。本轮四 worker/NCCL 2.21.5 在 10GiB 共享内存下通过，
+平台重启后恢复为 64MiB 时初始化失败；需先恢复足够容量。GPU 逻辑编号也可能在重启后对应不同物理卡，
+性能对照须记录并固定 UUID/PCI 和 NUMA 布局。
+
 ```bash
 python3.10 -m venv .venv-vpd
 .venv-vpd/bin/python -m pip install -r requirements-vpd-cuda.txt
@@ -115,6 +119,14 @@ PYTHONPATH=src .venv-vpd/bin/python utils/validate_vpd_multigpu.py \
 本机设备池回归和四进程单卡回环结果见 [验证摘要](docs/validation/device-pools-20261031.json)，不代表真实四卡验收。
 并发压测为 `benchmark_vpd.py` 增加 `--concurrency 2 --max-inflight 4`，或在一键验收时同时加 `--benchmark --concurrency 2`。并发度默认仍为 1，须显式设置；吞吐按整组请求的墙钟时间计算。
 并发路由的 [验证摘要](docs/validation/parallel-routing-20261031.json) 记录 103 项单元/集成测试、41 项启动器检查及真实 SmolVLM 并发冒烟；3 项多卡用例因硬件不足跳过。
+
+2026-11-01 的 [四卡报告](docs/validation/four-gpu-20261101.md) 和 [摘要](docs/validation/four-gpu-20261101.json)
+记录缓存 batch 形状修复、本机 106 项单元/集成测试及 41 项启动器检查，以及真实 4×RTX4090 验收。
+修复版本共 3420 条测量请求，其中 2280 条 VPD 请求逐 Token 对齐，HTTP 失败与 Token 不一致均为 0。
+固定拓扑 B 已完成 NCCL 并发 1/2/4、Gloo 并发 2 正式对照；同四卡、冷图无缓存时，
+客户端并发 1→2 的有效吞吐为 23.9→44.9 Token/s（+87.5%）。NCCL 并发 1、命中率 90% 的混合复用
+合成负载下，TTFT P50 为 144.2→126.4ms（降低 12.3%）；该并发的冷图约增加 0.7%。
+这些是条件明确的合成负载结果，不是单卡到四卡的成本/扩容收益，也不能套用历史单卡 48.5% 数字。
 
 - [多卡设备池、验收和测量方法](docs/vpd_multigpu.md)
 - [历史单卡消融实验](docs/vpd_benchmark.md)：保留当时源码和原始记录，不能作为当前三卡结果。
